@@ -60,6 +60,8 @@ struct Config {
     owner_password: String,
     allowed_redirects: Vec<String>,
     key_path: String,
+    /// Where DCR-registered clients are persisted (JSON, 0600) so they survive restart.
+    clients_path: String,
     access_ttl: u64,
     refresh_ttl: u64,
     /// Lifetime of an authorization code in seconds (capped short; single-use anyway).
@@ -95,6 +97,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             key_path: opt("DOORMAN_KEY_PATH").unwrap_or_else(|| "signing_key.pem".into()),
+            clients_path: opt("DOORMAN_CLIENTS_PATH").unwrap_or_else(|| "clients.json".into()),
             access_ttl: envn("DOORMAN_ACCESS_TTL", 3600),
             refresh_ttl: envn("DOORMAN_REFRESH_TTL", 60 * 60 * 24 * 60),
             code_ttl: envn("DOORMAN_CODE_TTL", 120).min(120),
@@ -136,11 +139,24 @@ struct Inner {
     dec: DecodingKey,
     jwk: serde_json::Value,
     codes: Mutex<HashMap<String, Code>>,
+    /// Registered OAuth clients (DCR + the pre-registered env client), keyed by client_id.
+    clients: Mutex<HashMap<String, Client>>,
     /// Per-IP fixed-window counters for the auth endpoints: ip -> (window_start, count).
     limits: Mutex<HashMap<IpAddr, (u64, u32)>>,
     http: reqwest::Client,
 }
 type AppState = Arc<Inner>;
+
+/// Cap on stored clients — a backstop against a registration flood filling disk.
+/// ponytail: fixed ceiling; rate-limiting already throttles /register.
+const MAX_CLIENTS: usize = 1000;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Client {
+    /// None ⇒ public client (PKCE-only, `token_endpoint_auth_method=none`).
+    secret: Option<String>,
+    redirect_uris: Vec<String>,
+}
 
 struct Code {
     challenge: String,
@@ -197,6 +213,17 @@ async fn main() {
 
 fn build_state(cfg: Config) -> AppState {
     let (enc, dec, jwk) = load_or_make_key(&cfg.key_path);
+    let mut clients = load_clients(&cfg.clients_path);
+    // Seed the pre-registered env client so it works alongside DCR-registered ones.
+    if !cfg.client_id.is_empty() {
+        clients.insert(
+            cfg.client_id.clone(),
+            Client {
+                secret: Some(cfg.client_secret.clone()),
+                redirect_uris: cfg.allowed_redirects.clone(),
+            },
+        );
+    }
     Arc::new(Inner {
         http: reqwest::Client::builder()
             .no_proxy()
@@ -206,9 +233,38 @@ fn build_state(cfg: Config) -> AppState {
         dec,
         jwk,
         codes: Mutex::new(HashMap::new()),
+        clients: Mutex::new(clients),
         limits: Mutex::new(HashMap::new()),
         cfg,
     })
+}
+
+fn load_clients(path: &str) -> HashMap<String, Client> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            panic!("clients file {path} is present but unparseable: {e} — fix or remove it")
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Write-through persistence for the client registry. Best-effort: a failed write is
+/// logged, not fatal — the in-memory registry is still authoritative for this run.
+fn save_clients(path: &str, clients: &HashMap<String, Client>) {
+    match serde_json::to_string_pretty(clients) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                eprintln!("doorman: warning: could not persist clients to {path}: {e}");
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Err(e) => eprintln!("doorman: warning: could not serialize clients: {e}"),
+    }
 }
 
 fn build_app(state: AppState) -> Router {
@@ -216,6 +272,7 @@ fn build_app(state: AppState) -> Router {
     let limited = Router::new()
         .route("/authorize", get(authorize_get).post(authorize_post))
         .route("/token", post(token))
+        .route("/register", post(register))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
 
     Router::new()
@@ -279,6 +336,7 @@ async fn as_meta(State(s): State<AppState>) -> Json<serde_json::Value> {
         "issuer": i,
         "authorization_endpoint": format!("{i}/authorize"),
         "token_endpoint": format!("{i}/token"),
+        "registration_endpoint": format!("{i}/register"),
         "jwks_uri": format!("{i}/.well-known/jwks.json"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -290,6 +348,70 @@ async fn as_meta(State(s): State<AppState>) -> Json<serde_json::Value> {
 
 async fn jwks(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({ "keys": [ s.jwk.clone() ] }))
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic client registration (RFC 7591)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    redirect_uris: Option<Vec<String>>,
+    token_endpoint_auth_method: Option<String>,
+}
+
+/// Open registration. This is safe because registering a client grants nothing on its
+/// own: the owner-password consent still gates every token, and redirect_uris are
+/// validated exactly. Registration is rate-limited and capped (MAX_CLIENTS).
+async fn register(State(s): State<AppState>, Json(r): Json<RegisterReq>) -> Response {
+    let redirect_uris = match r.redirect_uris {
+        Some(u) if !u.is_empty() => u,
+        _ => return oauth_err(StatusCode::BAD_REQUEST, "invalid_redirect_uri"),
+    };
+    if !redirect_uris.iter().all(|u| is_valid_redirect(u)) {
+        return oauth_err(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
+    }
+
+    let public = r.token_endpoint_auth_method.as_deref() == Some("none");
+    let client_id = random_token(24);
+    let secret = (!public).then(|| random_token(32));
+
+    {
+        let mut clients = s.clients.lock().unwrap();
+        if clients.len() >= MAX_CLIENTS {
+            return oauth_err(StatusCode::TOO_MANY_REQUESTS, "too_many_registrations");
+        }
+        clients.insert(
+            client_id.clone(),
+            Client {
+                secret: secret.clone(),
+                redirect_uris: redirect_uris.clone(),
+            },
+        );
+        save_clients(&s.cfg.clients_path, &clients);
+    }
+
+    let mut body = json!({
+        "client_id": client_id,
+        "client_id_issued_at": now(),
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": if public { "none" } else { "client_secret_basic" },
+    });
+    if let Some(sec) = secret {
+        body["client_secret"] = json!(sec);
+        body["client_secret_expires_at"] = json!(0); // never expires
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
+}
+
+/// Registered redirect URIs must be HTTPS (or localhost for dev) — never a scheme like
+/// javascript: or an arbitrary custom scheme.
+fn is_valid_redirect(u: &str) -> bool {
+    u.starts_with("https://")
+        || u.starts_with("http://localhost")
+        || u.starts_with("http://127.0.0.1")
 }
 
 // ---------------------------------------------------------------------------
@@ -416,9 +538,9 @@ fn validate_auth_req(s: &AppState, q: &AuthReq) -> Result<(), &'static str> {
     if q.response_type.as_deref() != Some("code") {
         return Err("unsupported response_type");
     }
-    if q.client_id.as_deref() != Some(s.cfg.client_id.as_str()) {
-        return Err("unknown client_id");
-    }
+    let client_id = q.client_id.as_deref().ok_or("unknown client_id")?;
+    let clients = s.clients.lock().unwrap();
+    let client = clients.get(client_id).ok_or("unknown client_id")?;
     if q.code_challenge_method.as_deref() != Some("S256") {
         return Err("code_challenge_method must be S256");
     }
@@ -430,11 +552,12 @@ fn validate_auth_req(s: &AppState, q: &AuthReq) -> Result<(), &'static str> {
         return Err("missing code_challenge");
     }
     match &q.redirect_uri {
-        Some(ru) if s.cfg.allowed_redirects.iter().any(|a| a == ru) => {}
+        // redirect_uri must exactly match one the client registered.
+        Some(ru) if client.redirect_uris.iter().any(|a| a == ru) => {}
         // Log the offending redirect_uri (it is not a secret) so the most common
-        // misconfig — a callback not in the allowlist — is trivial to diagnose.
+        // misconfig — a callback the client never registered — is trivial to diagnose.
         Some(ru) => {
-            eprintln!("doorman: rejected redirect_uri not in allowlist: {ru}");
+            eprintln!("doorman: rejected redirect_uri not registered for client: {ru}");
             return Err("redirect_uri not allowed");
         }
         None => return Err("missing redirect_uri"),
@@ -468,9 +591,19 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
             t.client_secret.clone().unwrap_or_default(),
         ),
     };
-    let client_ok: bool = cid.as_bytes().ct_eq(s.cfg.client_id.as_bytes()).into();
-    let secret_ok: bool = csec.as_bytes().ct_eq(s.cfg.client_secret.as_bytes()).into();
-    if !(client_ok && secret_ok) {
+    let authed = {
+        let clients = s.clients.lock().unwrap();
+        match clients.get(&cid) {
+            None => false,
+            // Public client (PKCE-only): no secret to verify; the code grant's PKCE
+            // check is the protection. Confidential client: constant-time secret compare.
+            Some(c) => match &c.secret {
+                None => true,
+                Some(sec) => csec.as_bytes().ct_eq(sec.as_bytes()).into(),
+            },
+        }
+    };
+    if !authed {
         return oauth_err(StatusCode::UNAUTHORIZED, "invalid_client");
     }
 
@@ -493,7 +626,7 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
             if sha256_b64url(verifier.as_bytes()) != entry.challenge {
                 return oauth_err(StatusCode::BAD_REQUEST, "invalid_grant");
             }
-            issue_tokens(&s, &entry.audience)
+            issue_tokens(&s, &entry.audience, &cid)
         }
         Some("refresh_token") => {
             let rt = t.refresh_token.unwrap_or_default();
@@ -502,7 +635,7 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
             v.set_audience(std::slice::from_ref(&s.cfg.issuer));
             match decode::<RefreshClaims>(&rt, &s.dec, &v) {
                 Ok(data) if data.claims.token_use == "refresh" => {
-                    issue_tokens(&s, &s.cfg.resource.clone())
+                    issue_tokens(&s, &s.cfg.resource.clone(), &cid)
                 }
                 _ => oauth_err(StatusCode::BAD_REQUEST, "invalid_grant"),
             }
@@ -511,7 +644,7 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
     }
 }
 
-fn issue_tokens(s: &AppState, audience: &str) -> Response {
+fn issue_tokens(s: &AppState, audience: &str, client_id: &str) -> Response {
     let iat = now();
     let access = AccessClaims {
         iss: s.cfg.issuer.clone(),
@@ -520,7 +653,7 @@ fn issue_tokens(s: &AppState, audience: &str) -> Response {
         exp: iat + s.cfg.access_ttl,
         iat,
         scope: "mcp".into(),
-        client_id: s.cfg.client_id.clone(),
+        client_id: client_id.to_string(),
     };
     let refresh = RefreshClaims {
         iss: s.cfg.issuer.clone(),
@@ -795,8 +928,12 @@ mod tests {
     const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
     fn test_cfg(upstream: &str) -> Config {
-        let mut kp = std::env::temp_dir();
-        kp.push(format!("doorman-test-{}.pem", random_token(8)));
+        let tag = random_token(8);
+        let tmp = |ext: &str| {
+            let mut p = std::env::temp_dir();
+            p.push(format!("doorman-test-{tag}.{ext}"));
+            p.to_string_lossy().into_owned()
+        };
         Config {
             issuer: "https://test.doorman".into(),
             resource: "https://test.doorman/mcp".into(),
@@ -809,7 +946,8 @@ mod tests {
             client_secret: "csec".into(),
             owner_password: "hunter2".into(),
             allowed_redirects: vec![REDIRECT.into()],
-            key_path: kp.to_string_lossy().into_owned(),
+            key_path: tmp("pem"),
+            clients_path: tmp("clients.json"),
             access_ttl: 3600,
             refresh_ttl: 3600,
             code_ttl: 120,
@@ -899,6 +1037,51 @@ mod tests {
     struct Response2 {
         status: reqwest::StatusCode,
         location: Option<String>,
+    }
+
+    /// Register a client via DCR; returns the parsed registration response.
+    async fn dcr_register(
+        c: &reqwest::Client,
+        base: &str,
+        auth_method: Option<&str>,
+    ) -> serde_json::Value {
+        let mut body = json!({ "redirect_uris": [REDIRECT] });
+        if let Some(m) = auth_method {
+            body["token_endpoint_auth_method"] = json!(m);
+        }
+        let resp = c
+            .post(format!("{base}/register"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        resp.json().await.unwrap()
+    }
+
+    /// Drive /authorize for an arbitrary client_id, returning the auth code.
+    async fn code_for(c: &reqwest::Client, base: &str, client_id: &str, challenge: &str) -> String {
+        let resp = c
+            .post(format!("{base}/authorize"))
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", challenge),
+                ("code_challenge_method", "S256"),
+                ("password", "hunter2"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let loc = resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        qp(&loc, "code").unwrap()
     }
 
     #[tokio::test]
@@ -1255,5 +1438,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 429);
+    }
+
+    #[tokio::test]
+    async fn dcr_confidential_client_can_complete_the_flow() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let reg = dcr_register(&c, &base, None).await;
+        let client_id = reg["client_id"].as_str().unwrap().to_string();
+        let client_secret = reg["client_secret"].as_str().unwrap().to_string();
+
+        let (verifier, challenge) = pkce();
+        let code = code_for(&c, &base, &client_id, &challenge).await;
+        let resp = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", &client_id),
+                ("client_secret", &client_secret),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn dcr_public_client_needs_no_secret() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let reg = dcr_register(&c, &base, Some("none")).await;
+        assert!(reg.get("client_secret").is_none());
+        let client_id = reg["client_id"].as_str().unwrap().to_string();
+
+        let (verifier, challenge) = pkce();
+        let code = code_for(&c, &base, &client_id, &challenge).await;
+        let resp = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", &client_id),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn dcr_rejects_non_https_redirect() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let resp = client()
+            .post(format!("{base}/register"))
+            .json(&json!({ "redirect_uris": ["http://evil.example/cb"] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn dcr_client_is_bound_to_its_registered_redirect() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let c = client();
+        let reg = dcr_register(&c, &base, None).await;
+        let client_id = reg["client_id"].as_str().unwrap().to_string();
+        let (_v, challenge) = pkce();
+        // Authorize with a redirect the client never registered.
+        let resp = c
+            .post(format!("{base}/authorize"))
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", "https://claude.ai/other/callback"),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("password", "hunter2"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn dcr_registered_client_survives_restart() {
+        let cfg = test_cfg("http://127.0.0.1:1");
+        let clients_path = cfg.clients_path.clone();
+        let base = spawn_doorman(cfg.clone()).await;
+        let reg = dcr_register(&client(), &base, None).await;
+        let client_id = reg["client_id"].as_str().unwrap().to_string();
+
+        // A fresh instance pointed at the same clients file must know the client.
+        let base2 = spawn_doorman(cfg).await;
+        assert!(std::path::Path::new(&clients_path).exists());
+        let (_v, challenge) = pkce();
+        let code = code_for(&client(), &base2, &client_id, &challenge).await;
+        assert!(!code.is_empty());
     }
 }

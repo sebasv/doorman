@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "web-programming"]
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 rsa = { version = "0.9", features = ["pem"] }
 serde = { version = "1", features = ["derive"] }

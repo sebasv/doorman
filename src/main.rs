@@ -11,13 +11,15 @@
 // Everything is driven by env vars — see Config::from_env below.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Form, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Form, Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post},
     Json, Router,
@@ -60,6 +62,10 @@ struct Config {
     key_path: String,
     access_ttl: u64,
     refresh_ttl: u64,
+    /// Lifetime of an authorization code in seconds (capped short; single-use anyway).
+    code_ttl: u64,
+    /// Max requests per IP per minute on /authorize and /token. 0 disables limiting.
+    rate_limit: u32,
 }
 
 impl Config {
@@ -91,6 +97,8 @@ impl Config {
             key_path: opt("DOORMAN_KEY_PATH").unwrap_or_else(|| "signing_key.pem".into()),
             access_ttl: envn("DOORMAN_ACCESS_TTL", 3600),
             refresh_ttl: envn("DOORMAN_REFRESH_TTL", 60 * 60 * 24 * 60),
+            code_ttl: envn("DOORMAN_CODE_TTL", 120).min(120),
+            rate_limit: envn("DOORMAN_RATE_LIMIT", 30) as u32,
             issuer,
         }
     }
@@ -128,6 +136,8 @@ struct Inner {
     dec: DecodingKey,
     jwk: serde_json::Value,
     codes: Mutex<HashMap<String, Code>>,
+    /// Per-IP fixed-window counters for the auth endpoints: ip -> (window_start, count).
+    limits: Mutex<HashMap<IpAddr, (u64, u32)>>,
     http: reqwest::Client,
 }
 type AppState = Arc<Inner>;
@@ -168,31 +178,7 @@ struct RefreshClaims {
 #[tokio::main]
 async fn main() {
     let cfg = Config::from_env();
-    let (enc, dec, jwk) = load_or_make_key(&cfg.key_path);
-
-    let state: AppState = Arc::new(Inner {
-        http: reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("http client"),
-        enc,
-        dec,
-        jwk,
-        codes: Mutex::new(HashMap::new()),
-        cfg,
-    });
-
-    let app = Router::new()
-        .route("/.well-known/oauth-protected-resource", get(prm))
-        .route("/.well-known/oauth-protected-resource/mcp", get(prm))
-        .route("/.well-known/oauth-authorization-server", get(as_meta))
-        .route("/.well-known/jwks.json", get(jwks))
-        .route("/authorize", get(authorize_get).post(authorize_post))
-        .route("/token", post(token))
-        .route("/health", get(|| async { "ok" }))
-        .route("/mcp", any(proxy))
-        .fallback(any(proxy))
-        .with_state(state.clone());
+    let state = build_state(cfg);
 
     let listener = tokio::net::TcpListener::bind(&state.cfg.bind)
         .await
@@ -205,7 +191,71 @@ async fn main() {
         state.cfg.upstream_path,
         state.cfg.bind
     );
+    let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, app).await.expect("serve");
+}
+
+fn build_state(cfg: Config) -> AppState {
+    let (enc, dec, jwk) = load_or_make_key(&cfg.key_path);
+    Arc::new(Inner {
+        http: reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        enc,
+        dec,
+        jwk,
+        codes: Mutex::new(HashMap::new()),
+        limits: Mutex::new(HashMap::new()),
+        cfg,
+    })
+}
+
+fn build_app(state: AppState) -> Router {
+    // Rate limiting applies only to the brute-forceable auth endpoints.
+    let limited = Router::new()
+        .route("/authorize", get(authorize_get).post(authorize_post))
+        .route("/token", post(token))
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
+
+    Router::new()
+        .route("/.well-known/oauth-protected-resource", get(prm))
+        .route("/.well-known/oauth-protected-resource/mcp", get(prm))
+        .route("/.well-known/oauth-authorization-server", get(as_meta))
+        .route("/.well-known/jwks.json", get(jwks))
+        .merge(limited)
+        .route("/health", get(|| async { "ok" }))
+        .route("/mcp", any(proxy))
+        .fallback(any(proxy))
+        // Cap request bodies. MCP JSON-RPC is small; this bounds a token-holding client.
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .with_state(state)
+}
+
+/// Per-IP fixed-window rate limit on the auth endpoints, keyed by the socket peer
+/// address (not a spoofable forwarded header). Behind a tunnel this is effectively a
+/// global limit on the tunnel's IP, which is the intended brute-force protection.
+async fn rate_limit(
+    State(s): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if s.cfg.rate_limit > 0 {
+        let ip = addr.ip();
+        let now = now();
+        let mut m = s.limits.lock().unwrap();
+        m.retain(|_, (start, _)| now.saturating_sub(*start) < 60);
+        let e = m.entry(ip).or_insert((now, 0));
+        if now.saturating_sub(e.0) >= 60 {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        if e.1 > s.cfg.rate_limit {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -339,15 +389,21 @@ async fn authorize_post(State(s): State<AppState>, Form(f): Form<AuthPost>) -> R
     // `resource` param, so a token can only ever be minted for the endpoint we guard.
     let audience = s.cfg.resource.clone();
     let code = random_token(32);
-    s.codes.lock().unwrap().insert(
-        code.clone(),
-        Code {
-            challenge: q.code_challenge.unwrap(),
-            redirect_uri: redirect_uri.clone(),
-            audience,
-            exp: now() + 120,
-        },
-    );
+    {
+        let mut codes = s.codes.lock().unwrap();
+        // Prune expired-but-never-redeemed codes so the map can't grow unbounded.
+        let now = now();
+        codes.retain(|_, c| c.exp >= now);
+        codes.insert(
+            code.clone(),
+            Code {
+                challenge: q.code_challenge.unwrap(),
+                redirect_uri: redirect_uri.clone(),
+                audience,
+                exp: now + s.cfg.code_ttl,
+            },
+        );
+    }
 
     let mut url = format!("{redirect_uri}?code={code}");
     if let Some(st) = q.state {
@@ -726,4 +782,478 @@ fn load_or_make_key(path: &str) -> (EncodingKey, DecodingKey, serde_json::Value)
         "e": e
     });
     (enc, dec, jwk)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
+
+    fn test_cfg(upstream: &str) -> Config {
+        let mut kp = std::env::temp_dir();
+        kp.push(format!("doorman-test-{}.pem", random_token(8)));
+        Config {
+            issuer: "https://test.doorman".into(),
+            resource: "https://test.doorman/mcp".into(),
+            bind: "127.0.0.1:0".into(),
+            upstream: upstream.to_string(),
+            upstream_path: "/mcp".into(),
+            upstream_header: "both".into(),
+            upstream_token: Some("upstream-secret".into()),
+            client_id: "cid".into(),
+            client_secret: "csec".into(),
+            owner_password: "hunter2".into(),
+            allowed_redirects: vec![REDIRECT.into()],
+            key_path: kp.to_string_lossy().into_owned(),
+            access_ttl: 3600,
+            refresh_ttl: 3600,
+            code_ttl: 120,
+            rate_limit: 0,
+        }
+    }
+
+    async fn spawn_doorman(cfg: Config) -> String {
+        let state = build_state(cfg);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Stub upstream that records the headers of the last request it received.
+    async fn spawn_stub() -> (String, Arc<Mutex<Option<HeaderMap>>>) {
+        let cap: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let c2 = cap.clone();
+        let app = Router::new().fallback(any(move |headers: HeaderMap, _b: Bytes| {
+            let c = c2.clone();
+            async move {
+                *c.lock().unwrap() = Some(headers);
+                "upstream-ok"
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), cap)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    fn pkce() -> (String, String) {
+        let verifier = random_token(32);
+        let challenge = sha256_b64url(verifier.as_bytes());
+        (verifier, challenge)
+    }
+
+    fn qp(url: &str, key: &str) -> Option<String> {
+        let q = url.split_once('?')?.1;
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_string())
+        })
+    }
+
+    /// Drive /authorize with the given password + challenge, return the auth code.
+    async fn get_code(
+        c: &reqwest::Client,
+        base: &str,
+        challenge: &str,
+        password: &str,
+    ) -> Response2 {
+        let resp = c
+            .post(format!("{base}/authorize"))
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", "cid"),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", challenge),
+                ("code_challenge_method", "S256"),
+                ("state", "xyz"),
+                ("password", password),
+            ])
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        Response2 { status, location }
+    }
+
+    struct Response2 {
+        status: reqwest::StatusCode,
+        location: Option<String>,
+    }
+
+    #[tokio::test]
+    async fn discovery_docs_advertise_endpoints() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let c = client();
+        let prm: serde_json::Value = c
+            .get(format!("{base}/.well-known/oauth-protected-resource"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(prm["resource"], "https://test.doorman/mcp");
+        assert_eq!(prm["authorization_servers"][0], "https://test.doorman");
+
+        let asm: serde_json::Value = c
+            .get(format!("{base}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(asm["code_challenge_methods_supported"][0], "S256");
+        assert_eq!(asm["token_endpoint"], "https://test.doorman/token");
+    }
+
+    #[tokio::test]
+    async fn happy_path_injects_downstream_credential_and_hides_claude_token() {
+        let (stub, cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        assert!(code.status.is_redirection());
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+
+        let tok: serde_json::Value = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let access = tok["access_token"].as_str().unwrap().to_string();
+        assert_eq!(tok["token_type"], "Bearer");
+
+        let resp = c
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&access)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let seen = cap.lock().unwrap().clone().unwrap();
+        // Upstream received the injected downstream credential (both header forms)...
+        assert_eq!(seen.get("x-mcp-token").unwrap(), "upstream-secret");
+        assert_eq!(seen.get("authorization").unwrap(), "Bearer upstream-secret");
+        // ...and never Claude's access token.
+        assert!(!seen
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&access));
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let (_v, challenge) = pkce();
+        let r = get_code(&client(), &base, &challenge, "wrong").await;
+        assert_eq!(r.status, 401);
+    }
+
+    #[tokio::test]
+    async fn tampered_pkce_verifier_is_rejected() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let c = client();
+        let (_verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+
+        let resp = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", "not-the-verifier"),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn redirect_uri_not_in_allowlist_is_rejected() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let (_v, challenge) = pkce();
+        let resp = client()
+            .post(format!("{base}/authorize"))
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", "cid"),
+                ("redirect_uri", "https://evil.example/callback"),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+                ("password", "hunter2"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn plain_pkce_method_is_rejected() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let resp = client()
+            .post(format!("{base}/authorize"))
+            .form(&[
+                ("response_type", "code"),
+                ("client_id", "cid"),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", "abc"),
+                ("code_challenge_method", "plain"),
+                ("password", "hunter2"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn bad_client_secret_is_rejected() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+
+        let resp = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "wrong"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn client_auth_via_basic_header_works() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+
+        let resp = c
+            .post(format!("{base}/token"))
+            .basic_auth("cid", Some("csec"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn authorization_code_is_single_use() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+            ("client_id", "cid"),
+            ("client_secret", "csec"),
+        ];
+        let first = c
+            .post(format!("{base}/token"))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        let second = c
+            .post(format!("{base}/token"))
+            .form(&form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn expired_authorization_code_is_rejected() {
+        let mut cfg = test_cfg("http://127.0.0.1:1");
+        cfg.code_ttl = 1;
+        let base = spawn_doorman(cfg).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+
+        // TTL is 1s but now() has whole-second resolution and the check is `>=`, so wait
+        // past 2s to guarantee the code's exp second is strictly behind the current second.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        let resp = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_works_but_access_token_is_not_a_refresh_token() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+        let (verifier, challenge) = pkce();
+        let code = get_code(&c, &base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+        let tok: serde_json::Value = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let access = tok["access_token"].as_str().unwrap().to_string();
+        let refresh = tok["refresh_token"].as_str().unwrap().to_string();
+
+        // A real refresh succeeds.
+        let ok = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+
+        // An access token presented as a refresh token is rejected.
+        let bad = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &access),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_proxy_returns_401_with_challenge() {
+        let base = spawn_doorman(test_cfg("http://127.0.0.1:1")).await;
+        let resp = client().get(format!("{base}/mcp")).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let wa = resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(wa.contains("resource_metadata="));
+    }
+
+    #[tokio::test]
+    async fn auth_endpoint_is_rate_limited() {
+        let mut cfg = test_cfg("http://127.0.0.1:1");
+        cfg.rate_limit = 3;
+        let base = spawn_doorman(cfg).await;
+        let c = client();
+        // First 3 requests pass the limiter (they fail auth, but not with 429).
+        for _ in 0..3 {
+            let r = c
+                .post(format!("{base}/token"))
+                .form(&[("grant_type", "authorization_code"), ("client_id", "cid")])
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(r.status(), 429);
+        }
+        // The 4th trips the limit.
+        let r = c
+            .post(format!("{base}/token"))
+            .form(&[("grant_type", "authorization_code"), ("client_id", "cid")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 429);
+    }
 }

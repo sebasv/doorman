@@ -71,62 +71,80 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Config {
-        let issuer = env("DOORMAN_ISSUER_URL").trim_end_matches('/').to_string();
+    /// Resolve config with precedence env > doorman.toml > default.
+    fn load() -> Config {
+        let file = load_toml();
+        let g = |k: &str| get_cfg(&file, k);
+        let issuer = g("issuer_url")
+            .expect("issuer URL required (DOORMAN_ISSUER_URL, or issuer_url in doorman.toml)")
+            .trim_end_matches('/')
+            .to_string();
         Config {
             resource: format!("{issuer}/mcp"),
-            bind: opt("DOORMAN_BIND").unwrap_or_else(|| "127.0.0.1:8080".into()),
-            upstream: opt("DOORMAN_UPSTREAM_URL")
+            bind: g("bind").unwrap_or_else(|| "127.0.0.1:8080".into()),
+            upstream: g("upstream_url")
                 .unwrap_or_else(|| "http://127.0.0.1:3000".into())
                 .trim_end_matches('/')
                 .to_string(),
-            upstream_path: opt("DOORMAN_UPSTREAM_PATH").unwrap_or_else(|| "/mcp".into()),
-            upstream_header: opt("DOORMAN_UPSTREAM_HEADER")
-                .unwrap_or_else(|| "Authorization".into()),
-            upstream_token: opt("DOORMAN_UPSTREAM_TOKEN"),
-            client_id: env("DOORMAN_CLIENT_ID"),
-            client_secret: env("DOORMAN_CLIENT_SECRET"),
+            upstream_path: g("upstream_path").unwrap_or_else(|| "/mcp".into()),
+            upstream_header: g("upstream_header").unwrap_or_else(|| "Authorization".into()),
+            upstream_token: g("upstream_token"),
+            client_id: g("client_id").unwrap_or_default(),
+            client_secret: g("client_secret").unwrap_or_default(),
             // Presence required, empty value allowed (no complexity gate). An empty
-            // password means anyone who reaches the consent page can approve — the
-            // missing-var panic below refuses to start silently in that state.
-            owner_password: env_owner_password(),
-            allowed_redirects: opt("DOORMAN_ALLOWED_REDIRECT_URIS")
+            // password means anyone who reaches the consent page can approve — so we
+            // refuse to start silently if it is not present at all.
+            owner_password: get_cfg_present(&file, "owner_password").expect(
+                "owner password required (DOORMAN_OWNER_PASSWORD, or owner_password in \
+                 doorman.toml). An empty value is allowed, but it must be present.",
+            ),
+            allowed_redirects: g("allowed_redirect_uris")
                 .unwrap_or_else(|| "https://claude.ai/api/mcp/auth_callback".into())
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            key_path: opt("DOORMAN_KEY_PATH").unwrap_or_else(|| "signing_key.pem".into()),
-            clients_path: opt("DOORMAN_CLIENTS_PATH").unwrap_or_else(|| "clients.json".into()),
-            access_ttl: envn("DOORMAN_ACCESS_TTL", 3600),
-            refresh_ttl: envn("DOORMAN_REFRESH_TTL", 60 * 60 * 24 * 60),
-            code_ttl: envn("DOORMAN_CODE_TTL", 120).min(120),
-            rate_limit: envn("DOORMAN_RATE_LIMIT", 30) as u32,
+            key_path: g("key_path").unwrap_or_else(|| "signing_key.pem".into()),
+            clients_path: g("clients_path").unwrap_or_else(|| "clients.json".into()),
+            access_ttl: g("access_ttl").and_then(|v| v.parse().ok()).unwrap_or(3600),
+            refresh_ttl: g("refresh_ttl")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60 * 60 * 24 * 60),
+            code_ttl: g("code_ttl")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120)
+                .min(120),
+            rate_limit: g("rate_limit").and_then(|v| v.parse().ok()).unwrap_or(30),
             issuer,
         }
     }
 }
 
-fn env(k: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| panic!("missing required env var {k}"))
+const CONFIG_FILE: &str = "doorman.toml";
+
+fn load_toml() -> toml::Table {
+    let path = std::env::var("DOORMAN_CONFIG").unwrap_or_else(|_| CONFIG_FILE.into());
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|e| panic!("{path} is present but not valid TOML: {e}")),
+        Err(_) => toml::Table::new(),
+    }
 }
-fn opt(k: &str) -> Option<String> {
-    std::env::var(k).ok().filter(|v| !v.is_empty())
-}
-fn envn(k: &str, default: u64) -> u64 {
-    std::env::var(k)
+
+/// env DOORMAN_<UPPER> (non-empty) beats the toml key beats absent.
+fn get_cfg(file: &toml::Table, key: &str) -> Option<String> {
+    std::env::var(format!("DOORMAN_{}", key.to_uppercase()))
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.get(key).and_then(|v| v.as_str()).map(String::from))
 }
-fn env_owner_password() -> String {
-    std::env::var("DOORMAN_OWNER_PASSWORD").unwrap_or_else(|_| {
-        panic!(
-            "missing required env var DOORMAN_OWNER_PASSWORD — set it to gate the consent page. \
-             An empty value is allowed (DOORMAN_OWNER_PASSWORD=\"\") but then anyone who reaches \
-             the authorize page can approve access, so only do that deliberately."
-        )
-    })
+
+/// Like get_cfg but treats an *empty* value as present (for owner_password).
+fn get_cfg_present(file: &toml::Table, key: &str) -> Option<String> {
+    std::env::var(format!("DOORMAN_{}", key.to_uppercase()))
+        .ok()
+        .or_else(|| file.get(key).and_then(|v| v.as_str()).map(String::from))
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +211,38 @@ struct RefreshClaims {
 
 #[tokio::main]
 async fn main() {
-    let cfg = Config::from_env();
+    let cmd = std::env::args().nth(1).unwrap_or_default();
+    match cmd.as_str() {
+        "run" => run().await,
+        "init" => init(),
+        "doctor" => doctor().await,
+        "funnel-cmd" => funnel_cmd(),
+        "--version" | "-V" => println!("doorman {}", env!("CARGO_PKG_VERSION")),
+        "--help" | "-h" | "" => print_usage(),
+        other => {
+            eprintln!("doorman: unknown command '{other}'\n");
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_usage() {
+    println!(
+        "doorman {} — OAuth 2.1 gate + reverse proxy for MCP servers\n\n\
+         USAGE:\n  doorman <command>\n\n\
+         COMMANDS:\n  \
+         run          Start the gate (reads config from env / doorman.toml)\n  \
+         init         Interactive setup: writes doorman.toml, prints connector values\n  \
+         doctor       Diagnose upstream, discovery, reachability, and a full token round-trip\n  \
+         funnel-cmd   Print the exact tunnel command to expose the gate\n  \
+         --version    Print version\n",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+async fn run() {
+    let cfg = Config::load();
     let state = build_state(cfg);
 
     let listener = tokio::net::TcpListener::bind(&state.cfg.bind)
@@ -209,6 +258,312 @@ async fn main() {
     );
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, app).await.expect("serve");
+}
+
+// ---------------------------------------------------------------------------
+// init — interactive setup
+// ---------------------------------------------------------------------------
+
+fn init() {
+    use std::io::Write;
+    println!("doorman init — interactive setup\n");
+
+    let issuer = prompt("Public issuer URL (e.g. https://pi.tailXXXX.ts.net)", None)
+        .trim_end_matches('/')
+        .to_string();
+    let upstream = prompt("Upstream URL", Some("http://127.0.0.1:3000"));
+    let upstream_path = prompt("Upstream MCP path", Some("/mcp"));
+    let upstream_header = prompt(
+        "Upstream auth header — Authorization | both | <custom name>",
+        Some("Authorization"),
+    );
+    let upstream_token = prompt(
+        "Upstream static token (blank if the upstream is open)",
+        Some(""),
+    );
+
+    let generated = random_token(18);
+    println!(
+        "\n  The owner password gates every authorization. Anyone who has it can approve\n  \
+         Claude's access to your upstream — treat it like the key to your house.\n"
+    );
+    let owner_password = prompt(
+        &format!("Owner password [press Enter to use generated: {generated}]"),
+        Some(&generated),
+    );
+
+    let client_id = random_token(16);
+    let client_secret = random_token(32);
+
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut toml = String::new();
+    toml.push_str(&format!("issuer_url = \"{}\"\n", esc(&issuer)));
+    toml.push_str(&format!("upstream_url = \"{}\"\n", esc(&upstream)));
+    toml.push_str(&format!("upstream_path = \"{}\"\n", esc(&upstream_path)));
+    toml.push_str(&format!(
+        "upstream_header = \"{}\"\n",
+        esc(&upstream_header)
+    ));
+    if !upstream_token.is_empty() {
+        toml.push_str(&format!("upstream_token = \"{}\"\n", esc(&upstream_token)));
+    }
+    toml.push_str(&format!("client_id = \"{}\"\n", esc(&client_id)));
+    toml.push_str(&format!("client_secret = \"{}\"\n", esc(&client_secret)));
+    toml.push_str(&format!("owner_password = \"{}\"\n", esc(&owner_password)));
+
+    if std::path::Path::new(CONFIG_FILE).exists() {
+        let overwrite = prompt(
+            &format!("{CONFIG_FILE} exists — overwrite? [y/N]"),
+            Some("N"),
+        );
+        if !overwrite.eq_ignore_ascii_case("y") {
+            println!("aborted; {CONFIG_FILE} left unchanged.");
+            return;
+        }
+    }
+    std::fs::write(CONFIG_FILE, &toml).expect("write doorman.toml");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Contains the owner password + client secret.
+        let _ = std::fs::set_permissions(CONFIG_FILE, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let _ = std::io::stdout().flush();
+    println!("\nWrote {CONFIG_FILE} (0600).\n");
+    println!("Add a custom connector in Claude with:");
+    println!("  URL:            {issuer}/mcp");
+    println!("  Client ID:      {client_id}");
+    println!("  Client Secret:  {client_secret}");
+    println!("\nWhen Claude sends you to the consent page, approve with the owner password:");
+    println!("  {owner_password}");
+    println!("\nNext:  doorman run     (then `doorman funnel-cmd` to expose it)");
+}
+
+fn prompt(label: &str, default: Option<&str>) -> String {
+    use std::io::Write;
+    loop {
+        print!("{label}: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            std::process::exit(1);
+        }
+        let val = line.trim().to_string();
+        if !val.is_empty() {
+            return val;
+        }
+        match default {
+            Some(d) => return d.to_string(),
+            None => println!("  (required)"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// doctor — end-to-end diagnostics
+// ---------------------------------------------------------------------------
+
+async fn doctor() {
+    let cfg = Config::load();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("http client");
+    let mut ok = true;
+    println!("doorman doctor — checking {}\n", cfg.issuer);
+
+    // 1. Upstream reachable.
+    let upstream_url = format!("{}{}", cfg.upstream, cfg.upstream_path);
+    match http.get(&upstream_url).send().await {
+        Ok(_) => report(true, &format!("upstream reachable ({upstream_url})"), ""),
+        Err(_) => {
+            ok = false;
+            report(
+                false,
+                &format!("upstream unreachable ({upstream_url})"),
+                "start the upstream, or fix DOORMAN_UPSTREAM_URL / _PATH",
+            );
+        }
+    }
+
+    // 2. Discovery doc served over the public issuer URL.
+    let prm_url = format!("{}/.well-known/oauth-protected-resource", cfg.issuer);
+    let discovery_ok = match http.get(&prm_url).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            body.get("resource").is_some()
+        }
+        _ => false,
+    };
+    if discovery_ok {
+        report(
+            true,
+            "discovery document served + reachable over the public URL",
+            "",
+        );
+    } else {
+        ok = false;
+        report(
+            false,
+            "discovery document not reachable at the public issuer URL",
+            "is `doorman run` up, and is the tunnel/DNS pointing at it? check DOORMAN_ISSUER_URL",
+        );
+    }
+
+    // 3. Unauthenticated /mcp returns 401 + challenge.
+    match http.get(format!("{}/mcp", cfg.issuer)).send().await {
+        Ok(r) if r.status() == 401 && r.headers().contains_key("www-authenticate") => report(
+            true,
+            "unauthenticated /mcp returns 401 + WWW-Authenticate",
+            "",
+        ),
+        Ok(r) => {
+            ok = false;
+            report(
+                false,
+                &format!(
+                    "unauthenticated /mcp returned {} (expected 401)",
+                    r.status()
+                ),
+                "the connector URL must end in /mcp; check the upstream isn't answering directly",
+            );
+        }
+        Err(_) => {
+            ok = false;
+            report(
+                false,
+                "could not reach /mcp",
+                "see the discovery check above",
+            );
+        }
+    }
+
+    // 4. Full self-driven OAuth + token round-trip (only if we have the client creds).
+    if cfg.client_id.is_empty() {
+        report(
+            true,
+            "skipping token round-trip (no pre-registered client_id configured)",
+            "",
+        );
+    } else if roundtrip(&http, &cfg).await {
+        report(true, "full OAuth + token round-trip succeeded", "");
+    } else {
+        ok = false;
+        report(
+            false,
+            "OAuth + token round-trip failed",
+            "check client_id/secret, owner_password, and allowed_redirect_uris",
+        );
+    }
+
+    println!();
+    if ok {
+        println!("All checks passed.");
+    } else {
+        println!("Some checks failed — see the fixes above.");
+        std::process::exit(1);
+    }
+}
+
+fn report(ok: bool, msg: &str, fix: &str) {
+    let mark = if ok { "\u{2713}" } else { "\u{2717}" };
+    println!("  {mark} {msg}");
+    if !ok && !fix.is_empty() {
+        println!("      fix: {fix}");
+    }
+}
+
+/// Drive authorize → token → authenticated /mcp against the live public URL.
+async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> bool {
+    let redirect = match cfg.allowed_redirects.first() {
+        Some(r) => r.clone(),
+        None => return false,
+    };
+    let verifier = random_token(32);
+    let challenge = sha256_b64url(verifier.as_bytes());
+
+    let auth = http
+        .post(format!("{}/authorize", cfg.issuer))
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", cfg.client_id.as_str()),
+            ("redirect_uri", redirect.as_str()),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("password", cfg.owner_password.as_str()),
+        ])
+        .send()
+        .await;
+    let location = match auth {
+        Ok(r) => r
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from),
+        Err(_) => None,
+    };
+    let code = match location.as_deref().and_then(|l| l.split_once('?')) {
+        Some((_, q)) => q.split('&').find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            (k == "code").then(|| v.to_string())
+        }),
+        None => None,
+    };
+    let code = match code {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let tok = http
+        .post(format!("{}/token", cfg.issuer))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("client_id", cfg.client_id.as_str()),
+            ("client_secret", cfg.client_secret.as_str()),
+        ])
+        .send()
+        .await;
+    let access = match tok {
+        Ok(r) => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            body.get("access_token")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }
+        Err(_) => None,
+    };
+    let access = match access {
+        Some(a) => a,
+        None => return false,
+    };
+
+    matches!(
+        http.post(format!("{}/mcp", cfg.issuer)).bearer_auth(&access).body("{}").send().await,
+        Ok(r) if r.status() != 401
+    )
+}
+
+// ---------------------------------------------------------------------------
+// funnel-cmd — print the exact tunnel command
+// ---------------------------------------------------------------------------
+
+fn funnel_cmd() {
+    let cfg = Config::load();
+    let port = cfg.bind.rsplit(':').next().unwrap_or("8080");
+    println!("Expose doorman (listening on {}) publicly:\n", cfg.bind);
+    println!("Tailscale Funnel (no DNS, no open ports):");
+    println!("  tailscale funnel --bg {port}\n");
+    println!("Cloudflare Tunnel — add to your config.yml ingress:");
+    println!("  ingress:");
+    println!("    - hostname: <your-hostname>");
+    println!("      service: http://{}", cfg.bind);
+    println!("    - service: http_status:404");
+    println!("  then: cloudflared tunnel run <tunnel-name>");
 }
 
 fn build_state(cfg: Config) -> AppState {
@@ -1543,5 +1898,25 @@ mod tests {
         let (_v, challenge) = pkce();
         let code = code_for(&client(), &base2, &client_id, &challenge).await;
         assert!(!code.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_roundtrip_succeeds_against_live_server() {
+        let (stub, _cap) = spawn_stub().await;
+        let cfg = test_cfg(&stub);
+        let mut dcfg = cfg.clone();
+        let base = spawn_doorman(cfg).await;
+        dcfg.issuer = base; // point the round-trip at the live ephemeral server
+        assert!(roundtrip(&client(), &dcfg).await);
+    }
+
+    #[tokio::test]
+    async fn doctor_roundtrip_fails_with_wrong_password() {
+        let cfg = test_cfg("http://127.0.0.1:1");
+        let mut dcfg = cfg.clone();
+        let base = spawn_doorman(cfg).await;
+        dcfg.issuer = base;
+        dcfg.owner_password = "wrong".into();
+        assert!(!roundtrip(&client(), &dcfg).await);
     }
 }

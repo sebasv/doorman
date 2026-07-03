@@ -1,0 +1,4 @@
+/target
+*.pem
+doorman.toml
+.env

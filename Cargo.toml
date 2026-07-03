@@ -1,0 +1,28 @@
+[package]
+name = "doorman"
+version = "0.1.0"
+edition = "2021"
+description = "Front any static-token or no-auth HTTP service with the OAuth 2.1 flow Claude requires — in one binary. No IdP, no database."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sebasv/doorman"
+readme = "README.md"
+keywords = ["oauth", "mcp", "proxy", "claude", "gateway"]
+categories = ["command-line-utilities", "web-programming"]
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["pem"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

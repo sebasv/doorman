@@ -1,12 +1,12 @@
-// picnic-oauth-proxy
-// A single-binary OAuth 2.1 authorization server + MCP resource-server reverse proxy.
+// doorman
+// A single-binary OAuth 2.1 authorization server + resource-server reverse proxy.
 //
-// It sits in front of mcp-picnic (which listens, token-gated, on 127.0.0.1) and becomes
-// the public face on your Tailscale Funnel URL. It speaks the exact OAuth dance the
-// claude.ai connector expects (RFC 9728 protected-resource metadata, RFC 8414 AS
-// metadata, PKCE/S256, audience-bound JWTs), and once a request carries a valid token
-// it reverse-proxies to mcp-picnic, injecting the static downstream token itself so the
-// upstream stays gated and Claude never sees it.
+// It sits in front of a static-token (or no-auth) HTTP service listening on 127.0.0.1
+// and becomes the public OAuth face that claude.ai's custom-connector UI expects. It
+// speaks the exact dance the connector requires (RFC 9728 protected-resource metadata,
+// RFC 8414 AS metadata, PKCE/S256, audience-bound JWTs), and once a request carries a
+// valid token it reverse-proxies to the upstream, injecting the upstream's own static
+// credential itself so the upstream stays gated and Claude never sees it.
 //
 // Everything is driven by env vars — see Config::from_env below.
 
@@ -39,15 +39,20 @@ use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 struct Config {
-    /// Public origin (Funnel URL), no trailing slash, e.g. https://pi.tailXXXX.ts.net
+    /// Public origin (e.g. the Funnel URL), no trailing slash, e.g. https://pi.tailXXXX.ts.net
     issuer: String,
     /// The canonical MCP resource URL = issuer + "/mcp". Tokens are audience-bound to this.
     resource: String,
     bind: String,
-    /// Upstream mcp-picnic base, e.g. http://127.0.0.1:3000
+    /// Upstream base, e.g. http://127.0.0.1:3000
     upstream: String,
-    /// Static token mcp-picnic expects (its HTTP_AUTH_TOKEN); injected downstream.
-    upstream_token: String,
+    /// Path on the upstream that the MCP endpoint is served at, e.g. "/mcp".
+    upstream_path: String,
+    /// Header the upstream expects its static credential in: "Authorization" (Bearer),
+    /// a custom header name (raw value, e.g. "x-mcp-token"), or "both".
+    upstream_header: String,
+    /// Static credential the upstream expects; injected downstream. None ⇒ no-auth upstream.
+    upstream_token: Option<String>,
     client_id: String,
     client_secret: String,
     owner_password: String,
@@ -59,28 +64,33 @@ struct Config {
 
 impl Config {
     fn from_env() -> Config {
-        let issuer = env("ISSUER_URL").trim_end_matches('/').to_string();
+        let issuer = env("DOORMAN_ISSUER_URL").trim_end_matches('/').to_string();
         Config {
             resource: format!("{issuer}/mcp"),
-            bind: std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into()),
-            upstream: std::env::var("UPSTREAM_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
+            bind: opt("DOORMAN_BIND").unwrap_or_else(|| "127.0.0.1:8080".into()),
+            upstream: opt("DOORMAN_UPSTREAM_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:3000".into())
                 .trim_end_matches('/')
                 .to_string(),
-            upstream_token: env("UPSTREAM_TOKEN"),
-            client_id: env("OAUTH_CLIENT_ID"),
-            client_secret: env("OAUTH_CLIENT_SECRET"),
-            owner_password: env("OWNER_PASSWORD"),
-            allowed_redirects: std::env::var("ALLOWED_REDIRECT_URIS")
-                .unwrap_or_else(|_| "https://claude.ai/api/mcp/auth_callback".into())
+            upstream_path: opt("DOORMAN_UPSTREAM_PATH").unwrap_or_else(|| "/mcp".into()),
+            upstream_header: opt("DOORMAN_UPSTREAM_HEADER")
+                .unwrap_or_else(|| "Authorization".into()),
+            upstream_token: opt("DOORMAN_UPSTREAM_TOKEN"),
+            client_id: env("DOORMAN_CLIENT_ID"),
+            client_secret: env("DOORMAN_CLIENT_SECRET"),
+            // Presence required, empty value allowed (no complexity gate). An empty
+            // password means anyone who reaches the consent page can approve — the
+            // missing-var panic below refuses to start silently in that state.
+            owner_password: env_owner_password(),
+            allowed_redirects: opt("DOORMAN_ALLOWED_REDIRECT_URIS")
+                .unwrap_or_else(|| "https://claude.ai/api/mcp/auth_callback".into())
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            key_path: std::env::var("SIGNING_KEY_PATH")
-                .unwrap_or_else(|_| "signing_key.pem".into()),
-            access_ttl: envn("ACCESS_TTL", 3600),
-            refresh_ttl: envn("REFRESH_TTL", 60 * 60 * 24 * 60),
+            key_path: opt("DOORMAN_KEY_PATH").unwrap_or_else(|| "signing_key.pem".into()),
+            access_ttl: envn("DOORMAN_ACCESS_TTL", 3600),
+            refresh_ttl: envn("DOORMAN_REFRESH_TTL", 60 * 60 * 24 * 60),
             issuer,
         }
     }
@@ -89,8 +99,23 @@ impl Config {
 fn env(k: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| panic!("missing required env var {k}"))
 }
+fn opt(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
 fn envn(k: &str, default: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn env_owner_password() -> String {
+    std::env::var("DOORMAN_OWNER_PASSWORD").unwrap_or_else(|_| {
+        panic!(
+            "missing required env var DOORMAN_OWNER_PASSWORD — set it to gate the consent page. \
+             An empty value is allowed (DOORMAN_OWNER_PASSWORD=\"\") but then anyone who reaches \
+             the authorize page can approve access, so only do that deliberately."
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +198,12 @@ async fn main() {
         .await
         .expect("bind");
     eprintln!(
-        "picnic-oauth-proxy: issuer={} resource={} -> upstream={} listening on {}",
-        state.cfg.issuer, state.cfg.resource, state.cfg.upstream, state.cfg.bind
+        "doorman: issuer={} resource={} -> upstream={}{} listening on {}",
+        state.cfg.issuer,
+        state.cfg.resource,
+        state.cfg.upstream,
+        state.cfg.upstream_path,
+        state.cfg.bind
     );
     axum::serve(listener, app).await.expect("serve");
 }
@@ -247,12 +276,12 @@ async fn authorize_get(State(s): State<AppState>, Query(q): Query<AuthReq>) -> R
     let form = format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Authorize Picnic MCP</title>
+<title>Authorize access</title>
 <style>body{{font-family:system-ui;max-width:22rem;margin:4rem auto;padding:0 1rem}}
 input[type=password]{{width:100%;padding:.6rem;font-size:1rem;box-sizing:border-box}}
 button{{margin-top:1rem;width:100%;padding:.6rem;font-size:1rem}}</style></head>
-<body><h2>Authorize Picnic access</h2>
-<p>Claude is requesting access to your Picnic MCP server.</p>
+<body><h2>Authorize access</h2>
+<p>An application is requesting access to your service through doorman.</p>
 <form method="post" action="/authorize">
 {rt}{cid}{ru}{cc}{ccm}{st}{res}
 <label>Owner password<br><input type="password" name="password" autofocus></label>
@@ -306,7 +335,9 @@ async fn authorize_post(State(s): State<AppState>, Form(f): Form<AuthPost>) -> R
     }
 
     let redirect_uri = q.redirect_uri.unwrap();
-    let audience = q.resource.clone().unwrap_or_else(|| s.cfg.resource.clone());
+    // Audience is pinned to our own resource — never taken from the client-supplied
+    // `resource` param, so a token can only ever be minted for the endpoint we guard.
+    let audience = s.cfg.resource.clone();
     let code = random_token(32);
     s.codes.lock().unwrap().insert(
         code.clone(),
@@ -335,12 +366,21 @@ fn validate_auth_req(s: &AppState, q: &AuthReq) -> Result<(), &'static str> {
     if q.code_challenge_method.as_deref() != Some("S256") {
         return Err("code_challenge_method must be S256");
     }
-    if q.code_challenge.as_deref().map(|c| c.is_empty()).unwrap_or(true) {
+    if q.code_challenge
+        .as_deref()
+        .map(|c| c.is_empty())
+        .unwrap_or(true)
+    {
         return Err("missing code_challenge");
     }
     match &q.redirect_uri {
         Some(ru) if s.cfg.allowed_redirects.iter().any(|a| a == ru) => {}
-        Some(_) => return Err("redirect_uri not allowed"),
+        // Log the offending redirect_uri (it is not a secret) so the most common
+        // misconfig — a callback not in the allowlist — is trivial to diagnose.
+        Some(ru) => {
+            eprintln!("doorman: rejected redirect_uri not in allowlist: {ru}");
+            return Err("redirect_uri not allowed");
+        }
         None => return Err("missing redirect_uri"),
     }
     Ok(())
@@ -402,8 +442,8 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
         Some("refresh_token") => {
             let rt = t.refresh_token.unwrap_or_default();
             let mut v = Validation::new(Algorithm::RS256);
-            v.set_issuer(&[s.cfg.issuer.clone()]);
-            v.set_audience(&[s.cfg.issuer.clone()]);
+            v.set_issuer(std::slice::from_ref(&s.cfg.issuer));
+            v.set_audience(std::slice::from_ref(&s.cfg.issuer));
             match decode::<RefreshClaims>(&rt, &s.dec, &v) {
                 Ok(data) if data.claims.token_use == "refresh" => {
                     issue_tokens(&s, &s.cfg.resource.clone())
@@ -470,18 +510,18 @@ async fn proxy(
         None => return unauthorized(&s),
     };
     let mut v = Validation::new(Algorithm::RS256);
-    v.set_issuer(&[s.cfg.issuer.clone()]);
-    v.set_audience(&[s.cfg.resource.clone()]);
+    v.set_issuer(std::slice::from_ref(&s.cfg.issuer));
+    v.set_audience(std::slice::from_ref(&s.cfg.resource));
     if decode::<AccessClaims>(&token, &s.dec, &v).is_err() {
         return unauthorized(&s);
     }
 
-    // 2. Forward to upstream mcp-picnic, injecting the downstream credential.
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(uri.path());
-    let url = format!("{}{}", s.cfg.upstream, path_and_query);
+    // 2. Forward to the upstream, injecting the downstream credential.
+    // ponytail: doorman fronts a single MCP endpoint, so every request is routed to
+    // the configured upstream path (carrying the query string) rather than mirroring
+    // arbitrary sub-paths. Fine for MCP-over-HTTP; revisit if a multi-route upstream shows up.
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let url = format!("{}{}{}", s.cfg.upstream, s.cfg.upstream_path, query);
 
     let mut req = s.http.request(method, &url);
     // Copy client headers except hop-by-hop / auth / host / length.
@@ -491,10 +531,18 @@ async fn proxy(
         }
         req = req.header(name.as_str(), value.as_bytes());
     }
-    // mcp-picnic gate: it never sees Claude's token, only this one.
-    // Inject both accepted forms so it works regardless of which header it checks.
-    req = req.header("x-mcp-token", &s.cfg.upstream_token);
-    req = req.header(header::AUTHORIZATION, format!("Bearer {}", s.cfg.upstream_token));
+    // The upstream never sees Claude's token, only its own configured credential.
+    if let Some(tok) = &s.cfg.upstream_token {
+        let h = s.cfg.upstream_header.as_str();
+        if h.eq_ignore_ascii_case("both") {
+            req = req.header("x-mcp-token", tok);
+            req = req.header(header::AUTHORIZATION, format!("Bearer {tok}"));
+        } else if h.eq_ignore_ascii_case("authorization") {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {tok}"));
+        } else {
+            req = req.header(h, tok);
+        }
+    }
     req = req.body(body);
 
     let upstream = match req.send().await {
@@ -544,7 +592,10 @@ fn unauthorized(s: &AppState) -> Response {
 // ---------------------------------------------------------------------------
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn random_token(bytes: usize) -> String {
@@ -645,7 +696,10 @@ fn load_or_make_key(path: &str) -> (EncodingKey, DecodingKey, serde_json::Value)
             eprintln!("no signing key at {path}, generating a fresh RSA-2048 key");
             let mut rng = rand::thread_rng();
             let key = RsaPrivateKey::new(&mut rng, 2048).expect("generate key");
-            let pem = key.to_pkcs8_pem(LineEnding::LF).expect("encode key").to_string();
+            let pem = key
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("encode key")
+                .to_string();
             std::fs::write(path, &pem).expect("write key");
             #[cfg(unix)]
             {
@@ -667,7 +721,7 @@ fn load_or_make_key(path: &str) -> (EncodingKey, DecodingKey, serde_json::Value)
         "kty": "RSA",
         "use": "sig",
         "alg": "RS256",
-        "kid": "picnic-oauth-1",
+        "kid": "doorman-1",
         "n": n,
         "e": e
     });

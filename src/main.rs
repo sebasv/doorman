@@ -217,6 +217,7 @@ async fn main() {
         "init" => init(),
         "doctor" => doctor().await,
         "funnel-cmd" => funnel_cmd(),
+        "install-service" => install_service(),
         "--version" | "-V" => println!("doorman {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "" => print_usage(),
         other => {
@@ -236,6 +237,7 @@ fn print_usage() {
          init         Interactive setup: writes doorman.toml, prints connector values\n  \
          doctor       Diagnose upstream, discovery, reachability, and a full token round-trip\n  \
          funnel-cmd   Print the exact tunnel command to expose the gate\n  \
+         install-service  Register doorman to start on boot (systemd / launchd / Windows task)\n  \
          --version    Print version\n",
         env!("CARGO_PKG_VERSION")
     );
@@ -337,7 +339,31 @@ fn init() {
     println!("  Client Secret:  {client_secret}");
     println!("\nWhen Claude sends you to the consent page, approve with the owner password:");
     println!("  {owner_password}");
-    println!("\nNext:  doorman run     (then `doorman funnel-cmd` to expose it)");
+
+    // Optional: register as a service (starts doorman), then expose it via Tailscale.
+    let svc = prompt(
+        "\nInstall doorman as a background service that starts on boot? [y/N]",
+        Some("N"),
+    );
+    let installed = svc.eq_ignore_ascii_case("y");
+    if installed {
+        install_service();
+    }
+
+    // Funnel forwards whatever port `bind` uses; init keeps the default.
+    let port = default_bind_port();
+    maybe_setup_tailscale(port);
+
+    if installed {
+        println!("\ndoorman is running as a service. Verify the whole path with:  doorman doctor");
+    } else {
+        println!("\nNext:  doorman run     (then `doorman funnel-cmd` if you skipped Tailscale)");
+    }
+}
+
+/// The port doorman listens on by default — used to pre-fill the Tailscale step.
+fn default_bind_port() -> &'static str {
+    "8080"
 }
 
 fn prompt(label: &str, default: Option<&str>) -> String {
@@ -564,6 +590,194 @@ fn funnel_cmd() {
     println!("      service: http://{}", cfg.bind);
     println!("    - service: http_status:404");
     println!("  then: cloudflared tunnel run <tunnel-name>");
+}
+
+/// If Tailscale is installed, offer to bring the Funnel up now; otherwise point the
+/// way. Called from `init`; safe to skip.
+fn maybe_setup_tailscale(port: &str) {
+    use std::process::Stdio;
+    let present = std::process::Command::new("tailscale")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !present {
+        println!(
+            "\nTailscale not found on PATH. Install it (https://tailscale.com/download), \
+             then run `doorman funnel-cmd`."
+        );
+        return;
+    }
+    let go = prompt(
+        &format!("\nExpose doorman on your tailnet with Tailscale Funnel (port {port}) now? [y/N]"),
+        Some("N"),
+    );
+    if go.eq_ignore_ascii_case("y") {
+        if run_cmd("tailscale", &["funnel", "--bg", port]) {
+            println!(
+                "Funnel is up. Your public URL is your tailnet HTTPS name — make sure it \
+                 matches the issuer_url you configured."
+            );
+        } else {
+            println!("Couldn't start the Funnel automatically; run `doorman funnel-cmd` for the manual command.");
+        }
+    } else {
+        println!("Skipped. Run `doorman funnel-cmd` when you're ready to expose it.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install-service — register doorman to start on boot, per platform
+// ---------------------------------------------------------------------------
+
+fn install_service() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            eprintln!("doorman: could not find own executable path: {e}");
+            return;
+        }
+    };
+    let workdir = match std::env::current_dir() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            eprintln!("doorman: could not determine working directory: {e}");
+            return;
+        }
+    };
+
+    if cfg!(target_os = "linux") {
+        install_systemd(&exe, &workdir);
+    } else if cfg!(target_os = "macos") {
+        install_launchd(&exe, &workdir);
+    } else if cfg!(target_os = "windows") {
+        print_windows_service(&exe, &workdir);
+    } else {
+        println!("Automatic service install isn't supported on this OS. Run `doorman run` under your process manager, from {workdir}.");
+    }
+}
+
+fn install_systemd(exe: &str, workdir: &str) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("doorman: HOME is not set; cannot place a user unit");
+            return;
+        }
+    };
+    let dir = format!("{home}/.config/systemd/user");
+    let path = format!("{dir}/doorman.service");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("doorman: could not create {dir}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, systemd_unit(exe, workdir)) {
+        eprintln!("doorman: could not write {path}: {e}");
+        return;
+    }
+    println!("Wrote {path}");
+    run_cmd("systemctl", &["--user", "daemon-reload"]);
+    run_cmd(
+        "systemctl",
+        &["--user", "enable", "--now", "doorman.service"],
+    );
+    println!("Enabled the doorman user service.");
+    println!("To keep it running while you're logged out (e.g. a headless Pi), run once:");
+    println!("  sudo loginctl enable-linger \"$USER\"");
+}
+
+fn install_launchd(exe: &str, workdir: &str) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("doorman: HOME is not set; cannot place a LaunchAgent");
+            return;
+        }
+    };
+    let label = "dev.doorman";
+    let dir = format!("{home}/Library/LaunchAgents");
+    let path = format!("{dir}/{label}.plist");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("doorman: could not create {dir}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, launchd_plist(exe, workdir, label)) {
+        eprintln!("doorman: could not write {path}: {e}");
+        return;
+    }
+    println!("Wrote {path}");
+    // Reload cleanly: unload if it was already loaded, then load.
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &path])
+        .status();
+    run_cmd("launchctl", &["load", "-w", &path]);
+    println!("Loaded the doorman LaunchAgent.");
+}
+
+fn print_windows_service(exe: &str, workdir: &str) {
+    println!("On Windows, register a logon task (run in an elevated prompt):");
+    println!("  schtasks /create /tn doorman /sc onlogon /rl highest \\");
+    println!("    /tr \"cmd /c cd /d \\\"{workdir}\\\" && \\\"{exe}\\\" run\"");
+    println!("\nOr use a service wrapper (nssm / WinSW) pointing at:");
+    println!("  \"{exe}\" run   (working directory: {workdir})");
+}
+
+/// Run a command inheriting stdio; returns whether it succeeded.
+fn run_cmd(cmd: &str, args: &[&str]) -> bool {
+    match std::process::Command::new(cmd).args(args).status() {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("  `{cmd} {}` exited with {s}", args.join(" "));
+            false
+        }
+        Err(e) => {
+            eprintln!("  could not run `{cmd}`: {e}");
+            false
+        }
+    }
+}
+
+fn systemd_unit(exe: &str, workdir: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=doorman OAuth gate\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         ExecStart={exe} run\n\
+         WorkingDirectory={workdir}\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+fn launchd_plist(exe: &str, workdir: &str, label: &str) -> String {
+    let x = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string><string>run</string></array>
+  <key>WorkingDirectory</key><string>{workdir}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+"#,
+        exe = x(exe),
+        workdir = x(workdir),
+    )
 }
 
 fn build_state(cfg: Config) -> AppState {
@@ -1918,5 +2132,25 @@ mod tests {
         dcfg.issuer = base;
         dcfg.owner_password = "wrong".into();
         assert!(!roundtrip(&client(), &dcfg).await);
+    }
+
+    #[test]
+    fn systemd_unit_runs_the_binary_from_the_workdir() {
+        let u = systemd_unit("/usr/bin/doorman", "/var/lib/doorman");
+        assert!(u.contains("ExecStart=/usr/bin/doorman run"));
+        assert!(u.contains("WorkingDirectory=/var/lib/doorman"));
+        assert!(u.contains("Restart=on-failure"));
+        assert!(u.contains("[Install]"));
+    }
+
+    #[test]
+    fn launchd_plist_is_well_formed_and_xml_escaped() {
+        let p = launchd_plist("/opt/doorman & co/doorman", "/home/me", "dev.doorman");
+        assert!(p.contains("<key>Label</key><string>dev.doorman</string>"));
+        assert!(p.contains("<string>run</string>"));
+        assert!(p.contains("<key>RunAtLoad</key><true/>"));
+        // the & in the path must be escaped for valid XML
+        assert!(p.contains("/opt/doorman &amp; co/doorman"));
+        assert!(!p.contains("doorman & co"));
     }
 }

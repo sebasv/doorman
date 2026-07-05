@@ -579,9 +579,16 @@ fn ask_public_url() -> String {
 
 fn print_tailscale_install() {
     if cfg!(target_os = "linux") {
-        println!("  curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up");
+        println!("  curl -fsSL https://tailscale.com/install.sh | sh");
+        println!("  sudo tailscale up                     # log in (opens a browser)");
     } else if cfg!(target_os = "macos") {
-        println!("  brew install tailscale && sudo tailscale up   (or install the Mac app)");
+        println!("  brew install tailscale");
+        println!("  sudo brew services start tailscale    # run the daemon as root");
+        println!("  sudo tailscale up                     # log in (opens a browser)");
+        println!("  (Homebrew warns about root-owned paths and \"start at user login\" —");
+        println!(
+            "   both are cosmetic, safe to ignore. Or use the Mac app: tailscale.com/download)"
+        );
     } else {
         println!("  Install from https://tailscale.com/download, then run `tailscale up`.");
     }

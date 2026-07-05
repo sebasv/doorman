@@ -68,17 +68,27 @@ struct Config {
     code_ttl: u64,
     /// Max requests per IP per minute on /authorize and /token. 0 disables limiting.
     rate_limit: u32,
+    /// Command doorman runs and supervises as the upstream (localhost). None ⇒ external upstream.
+    spawn_cmd: Option<String>,
+    /// Tailscale Funnel port this instance uses (443/8443/10000), if any — for doctor/delete.
+    funnel_port: Option<u16>,
+    /// Instance name (not stored in the toml; identifies paths, service, funnel).
+    name: String,
 }
 
 impl Config {
-    /// Resolve config with precedence env > doorman.toml > default.
-    fn load() -> Config {
-        let file = load_toml();
+    /// Resolve the named instance's config with precedence env > config.toml > default.
+    fn load(name: &str) -> Config {
+        let file = load_toml(name);
         let g = |k: &str| get_cfg(&file, k);
         let issuer = g("issuer_url")
-            .expect("issuer URL required (DOORMAN_ISSUER_URL, or issuer_url in doorman.toml)")
+            .unwrap_or_else(|| {
+                panic!("issuer_url not set for instance '{name}'. Run: doorman init {name}")
+            })
             .trim_end_matches('/')
             .to_string();
+        let dir = instance_dir(name);
+        let in_dir = |f: &str| dir.join(f).to_string_lossy().into_owned();
         Config {
             resource: format!("{issuer}/mcp"),
             bind: g("bind").unwrap_or_else(|| "127.0.0.1:8080".into()),
@@ -94,18 +104,17 @@ impl Config {
             // Presence required, empty value allowed (no complexity gate). An empty
             // password means anyone who reaches the consent page can approve — so we
             // refuse to start silently if it is not present at all.
-            owner_password: get_cfg_present(&file, "owner_password").expect(
-                "owner password required (DOORMAN_OWNER_PASSWORD, or owner_password in \
-                 doorman.toml). An empty value is allowed, but it must be present.",
-            ),
+            owner_password: get_cfg_present(&file, "owner_password").unwrap_or_else(|| {
+                panic!("owner_password not set for '{name}'. Run: doorman init {name}")
+            }),
             allowed_redirects: g("allowed_redirect_uris")
                 .unwrap_or_else(|| "https://claude.ai/api/mcp/auth_callback".into())
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            key_path: g("key_path").unwrap_or_else(|| "signing_key.pem".into()),
-            clients_path: g("clients_path").unwrap_or_else(|| "clients.json".into()),
+            key_path: g("key_path").unwrap_or_else(|| in_dir("signing_key.pem")),
+            clients_path: g("clients_path").unwrap_or_else(|| in_dir("clients.json")),
             access_ttl: g("access_ttl").and_then(|v| v.parse().ok()).unwrap_or(3600),
             refresh_ttl: g("refresh_ttl")
                 .and_then(|v| v.parse().ok())
@@ -115,19 +124,44 @@ impl Config {
                 .unwrap_or(120)
                 .min(120),
             rate_limit: g("rate_limit").and_then(|v| v.parse().ok()).unwrap_or(30),
+            spawn_cmd: g("spawn_cmd"),
+            funnel_port: g("funnel_port").and_then(|v| v.parse().ok()),
             issuer,
+            name: name.to_string(),
         }
     }
 }
 
-const CONFIG_FILE: &str = "doorman.toml";
+/// Root config directory holding all instances.
+fn root_dir() -> std::path::PathBuf {
+    if cfg!(target_os = "windows") {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&base).join("doorman")
+    } else {
+        let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.config")
+        });
+        std::path::Path::new(&base).join("doorman")
+    }
+}
 
-fn load_toml() -> toml::Table {
-    let path = std::env::var("DOORMAN_CONFIG").unwrap_or_else(|_| CONFIG_FILE.into());
+fn instance_dir(name: &str) -> std::path::PathBuf {
+    root_dir().join(name)
+}
+
+fn config_path(name: &str) -> std::path::PathBuf {
+    instance_dir(name).join("config.toml")
+}
+
+fn load_toml(name: &str) -> toml::Table {
+    let path = std::env::var("DOORMAN_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| config_path(name));
     match std::fs::read_to_string(&path) {
         Ok(s) => s
             .parse()
-            .unwrap_or_else(|e| panic!("{path} is present but not valid TOML: {e}")),
+            .unwrap_or_else(|e| panic!("{} is present but not valid TOML: {e}", path.display())),
         Err(_) => toml::Table::new(),
     }
 }
@@ -211,13 +245,22 @@ struct RefreshClaims {
 
 #[tokio::main]
 async fn main() {
-    let cmd = std::env::args().nth(1).unwrap_or_default();
-    match cmd.as_str() {
-        "run" => run().await,
-        "init" => init(),
-        "doctor" => doctor().await,
-        "funnel-cmd" => funnel_cmd(),
-        "install-service" => install_service(),
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args.get(1).map(String::as_str).unwrap_or("");
+    // Optional instance name is the 2nd positional arg; defaults to "default".
+    let name = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("default")
+        .to_string();
+    match cmd {
+        "run" => run(&name).await,
+        "init" => init(&name),
+        "doctor" => doctor(&name).await,
+        "delete" => delete(&name),
+        "list" => list(),
+        "funnel-cmd" => funnel_cmd(&name),
+        "install-service" => install_service(&name),
         "--version" | "-V" => println!("doorman {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "" => print_usage(),
         other => {
@@ -231,139 +274,312 @@ async fn main() {
 fn print_usage() {
     println!(
         "doorman {} — OAuth 2.1 gate + reverse proxy for MCP servers\n\n\
-         USAGE:\n  doorman <command>\n\n\
+         USAGE:\n  doorman <command> [instance-name]      (instance defaults to \"default\")\n\n\
          COMMANDS:\n  \
-         run          Start the gate (reads config from env / doorman.toml)\n  \
-         init         Interactive setup: writes doorman.toml, prints connector values\n  \
-         doctor       Diagnose upstream, discovery, reachability, and a full token round-trip\n  \
-         funnel-cmd   Print the exact tunnel command to expose the gate\n  \
-         install-service  Register doorman to start on boot (systemd / launchd / Windows task)\n  \
-         --version    Print version\n",
+         init [name]      Interactive setup for an instance; prints connector values\n  \
+         run [name]       Start the instance (and supervise its upstream if configured)\n  \
+         doctor [name]    Diagnose upstream, funnel, discovery, and a full token round-trip\n  \
+         delete [name]    Stop & remove an instance (service, funnel, config)\n  \
+         list             List configured instances and their status\n  \
+         funnel-cmd [name]  Print the tunnel command to expose an instance\n  \
+         install-service [name]  Register an instance to start on boot\n  \
+         --version        Print version\n",
         env!("CARGO_PKG_VERSION")
     );
 }
 
-async fn run() {
-    let cfg = Config::load();
-    let state = build_state(cfg);
+async fn run(name: &str) {
+    let cfg = Config::load(name);
+    // If configured, run the upstream as a supervised child on localhost.
+    let _child = cfg.spawn_cmd.clone().map(spawn_supervised);
 
+    let state = build_state(cfg);
     let listener = tokio::net::TcpListener::bind(&state.cfg.bind)
         .await
         .expect("bind");
     eprintln!(
-        "doorman: issuer={} resource={} -> upstream={}{} listening on {}",
+        "doorman[{}]: issuer={} -> upstream={}{} listening on {}",
+        state.cfg.name,
         state.cfg.issuer,
-        state.cfg.resource,
         state.cfg.upstream,
         state.cfg.upstream_path,
         state.cfg.bind
     );
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
-    axum::serve(listener, app).await.expect("serve");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("serve");
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Handle for a supervised upstream child. Dropping it aborts the supervisor loop;
+/// the running child is killed via `kill_on_drop`.
+struct ChildGuard(tokio::task::JoinHandle<()>);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the upstream via the shell and keep it alive, restarting on exit.
+/// ponytail: kill_on_drop kills the shell child on shutdown; under a service manager
+/// (systemd/launchd) the whole process tree is reaped by the unit anyway. Process-group
+/// kill is the upgrade path if orphaned grandchildren become a problem in foreground use.
+fn spawn_supervised(cmd: String) -> ChildGuard {
+    ChildGuard(tokio::spawn(async move {
+        loop {
+            let mut c = if cfg!(target_os = "windows") {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C").arg(&cmd);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(&cmd);
+                c
+            };
+            match c.kill_on_drop(true).spawn() {
+                Ok(mut child) => {
+                    eprintln!("doorman: started upstream: {cmd}");
+                    let status = child.wait().await;
+                    eprintln!("doorman: upstream exited ({status:?}); restarting in 2s");
+                }
+                Err(e) => {
+                    eprintln!("doorman: could not start upstream `{cmd}`: {e}; retrying in 2s")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // init — interactive setup
 // ---------------------------------------------------------------------------
 
-fn init() {
-    use std::io::Write;
-    println!("doorman init — interactive setup\n");
-
-    let issuer = prompt("Public issuer URL (e.g. https://pi.tailXXXX.ts.net)", None)
-        .trim_end_matches('/')
-        .to_string();
-    let upstream = prompt("Upstream URL", Some("http://127.0.0.1:3000"));
-    let upstream_path = prompt("Upstream MCP path", Some("/mcp"));
-    let upstream_header = prompt(
-        "Upstream auth header — Authorization | both | <custom name>",
-        Some("Authorization"),
-    );
-    let upstream_token = prompt(
-        "Upstream static token (blank if the upstream is open)",
-        Some(""),
-    );
-
-    let generated = random_token(18);
+fn init(name: &str) {
+    println!("doorman init — let's connect an MCP server to Claude (instance: {name})\n");
+    println!("doorman runs your MCP server, guards it behind a password, and puts it on");
+    println!("the internet so Claude can reach it. You'll need two things:");
+    println!("  1. the MCP server you want to use ('upstream' — the service we gate)");
     println!(
-        "\n  The owner password gates every authorization. Anyone who has it can approve\n  \
-         Claude's access to your upstream — treat it like the key to your house.\n"
+        "  2. a public address (Claude runs in the cloud) — easiest via Tailscale, we'll help.\n"
     );
+
+    if config_path(name).exists()
+        && !ask_yes(
+            &format!("Instance '{name}' already exists — overwrite it?"),
+            false,
+        )
+    {
+        println!("Aborted; '{name}' left unchanged.");
+        return;
+    }
+
+    // --- Step 1: the upstream ---------------------------------------------------
+    println!("\n── Your MCP server ──");
+    let (bind_port, _f) = assign_ports(name);
+    let mut cfg: Vec<(String, String)> = Vec::new();
+    cfg.push(("bind".into(), format!("127.0.0.1:{bind_port}")));
+
+    if ask_yes(
+        "Should doorman run your MCP server for you? (recommended — you give the start command)",
+        true,
+    ) {
+        let spawn_cmd = prompt(
+            "  Command that starts your MCP server (e.g. npx -y mcp-picnic --enable-http --http-port 3000)",
+            None,
+        );
+        let uport = prompt("  Which port does it listen on?", Some("3000"));
+        let upath = prompt("  What path is the MCP endpoint on?", Some("/mcp"));
+        println!("  → doorman will run it on localhost where only doorman can reach it, so no upstream token is needed.");
+        cfg.push(("spawn_cmd".into(), spawn_cmd));
+        cfg.push(("upstream_url".into(), format!("http://127.0.0.1:{uport}")));
+        cfg.push(("upstream_path".into(), upath));
+    } else {
+        println!("  OK — point doorman at your already-running server.");
+        let url = prompt("  Upstream URL", Some("http://127.0.0.1:3000"));
+        let upath = prompt("  MCP path", Some("/mcp"));
+        cfg.push(("upstream_url".into(), url));
+        cfg.push(("upstream_path".into(), upath));
+        if ask_yes(
+            "  Does your upstream require an auth header/token to reach it? (many don't)",
+            false,
+        ) {
+            let header = prompt(
+                "    Header name — Authorization (Bearer) | both | <custom, e.g. x-mcp-token>",
+                Some("Authorization"),
+            );
+            let token = prompt("    Token value", None);
+            cfg.push(("upstream_header".into(), header));
+            cfg.push(("upstream_token".into(), token));
+        }
+    }
+
+    // --- Step 2: the public address --------------------------------------------
+    println!("\n── Public address ──");
+    println!("Claude is in the cloud, so it needs a public HTTPS URL for doorman.");
+    let (issuer, funnel_port) = choose_public_address();
+    cfg.push(("issuer_url".into(), issuer.clone()));
+    if let Some(fp) = funnel_port {
+        cfg.push(("funnel_port".into(), fp.to_string()));
+    }
+
+    // --- Step 3: owner password -------------------------------------------------
+    println!("\n── Owner password ──");
+    println!("This is the key to your service: anyone who has it can approve Claude's access.");
+    let generated = random_token(18);
     let owner_password = prompt(
-        &format!("Owner password [press Enter to use generated: {generated}]"),
+        &format!("Owner password [Enter to use generated: {generated}]"),
         Some(&generated),
     );
 
+    // --- Write config -----------------------------------------------------------
     let client_id = random_token(16);
     let client_secret = random_token(32);
+    cfg.push(("client_id".into(), client_id.clone()));
+    cfg.push(("client_secret".into(), client_secret.clone()));
+    cfg.push(("owner_password".into(), owner_password.clone()));
+    write_config(name, &cfg);
+    println!("\nWrote {} (0600).", config_path(name).display());
 
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut toml = String::new();
-    toml.push_str(&format!("issuer_url = \"{}\"\n", esc(&issuer)));
-    toml.push_str(&format!("upstream_url = \"{}\"\n", esc(&upstream)));
-    toml.push_str(&format!("upstream_path = \"{}\"\n", esc(&upstream_path)));
-    toml.push_str(&format!(
-        "upstream_header = \"{}\"\n",
-        esc(&upstream_header)
-    ));
-    if !upstream_token.is_empty() {
-        toml.push_str(&format!("upstream_token = \"{}\"\n", esc(&upstream_token)));
-    }
-    toml.push_str(&format!("client_id = \"{}\"\n", esc(&client_id)));
-    toml.push_str(&format!("client_secret = \"{}\"\n", esc(&client_secret)));
-    toml.push_str(&format!("owner_password = \"{}\"\n", esc(&owner_password)));
-
-    if std::path::Path::new(CONFIG_FILE).exists() {
-        let overwrite = prompt(
-            &format!("{CONFIG_FILE} exists — overwrite? [y/N]"),
-            Some("N"),
-        );
-        if !overwrite.eq_ignore_ascii_case("y") {
-            println!("aborted; {CONFIG_FILE} left unchanged.");
-            return;
-        }
-    }
-    std::fs::write(CONFIG_FILE, &toml).expect("write doorman.toml");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Contains the owner password + client secret.
-        let _ = std::fs::set_permissions(CONFIG_FILE, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let _ = std::io::stdout().flush();
-    println!("\nWrote {CONFIG_FILE} (0600).\n");
-    println!("Add a custom connector in Claude with:");
+    println!("\nAdd a custom connector in Claude with:");
     println!("  URL:            {issuer}/mcp");
     println!("  Client ID:      {client_id}");
     println!("  Client Secret:  {client_secret}");
-    println!("\nWhen Claude sends you to the consent page, approve with the owner password:");
-    println!("  {owner_password}");
+    println!("  Owner password: {owner_password}   (typed on the consent page)");
 
-    // Optional: register as a service (starts doorman), then expose it via Tailscale.
-    let svc = prompt(
-        "\nInstall doorman as a background service that starts on boot? [y/N]",
-        Some("N"),
+    // --- Step 4: run as a service ----------------------------------------------
+    println!();
+    let installed = ask_yes(
+        "Keep doorman running in the background and start it on boot?",
+        true,
     );
-    let installed = svc.eq_ignore_ascii_case("y");
     if installed {
-        install_service();
+        install_service(name);
     }
 
-    // Funnel forwards whatever port `bind` uses; init keeps the default.
-    let port = default_bind_port();
-    maybe_setup_tailscale(port);
+    // --- Step 5: bring the funnel up -------------------------------------------
+    if let Some(fp) = funnel_port {
+        if ask_yes(
+            &format!("Expose it now via Tailscale Funnel (port {fp})?"),
+            true,
+        ) {
+            if run_cmd(
+                "tailscale",
+                &[
+                    "funnel",
+                    "--bg",
+                    &format!("--https={fp}"),
+                    &bind_port.to_string(),
+                ],
+            ) {
+                println!("Funnel is up at {issuer}");
+            } else {
+                println!("Funnel didn't start — you may need to enable Funnel in the Tailscale admin console.");
+            }
+        }
+    }
 
     if installed {
-        println!("\ndoorman is running as a service. Verify the whole path with:  doorman doctor");
+        println!(
+            "\n✓ Done. doorman is running. Verify the whole path with:  doorman doctor {name}"
+        );
     } else {
-        println!("\nNext:  doorman run     (then `doorman funnel-cmd` if you skipped Tailscale)");
+        println!("\n✓ Done. Start it with:  doorman run {name}");
     }
 }
 
-/// The port doorman listens on by default — used to pre-fill the Tailscale step.
-fn default_bind_port() -> &'static str {
-    "8080"
+/// Decide the public HTTPS address: automate via Tailscale when possible, else ask.
+/// Returns (issuer_url, funnel_port).
+fn choose_public_address() -> (String, Option<u16>) {
+    match tailscale_dnsname() {
+        Some(dns) => {
+            let fp = next_funnel_port();
+            match fp {
+                Some(fp) => {
+                    let issuer = if fp == 443 {
+                        format!("https://{dns}")
+                    } else {
+                        format!("https://{dns}:{fp}")
+                    };
+                    println!(
+                        "Tailscale is set up. doorman will expose this instance at:\n  {issuer}"
+                    );
+                    (issuer, Some(fp))
+                }
+                None => {
+                    println!("All 3 Tailscale Funnel ports are already in use by other instances.");
+                    (ask_public_url(), None)
+                }
+            }
+        }
+        None if tailscale_present() => {
+            println!("Tailscale is installed but not logged in. Run `tailscale up` to log in,");
+            println!("then re-run `doorman init`. For now, enter your public address manually:");
+            (ask_public_url(), None)
+        }
+        None => {
+            println!("Tailscale isn't installed. It gives you a free public HTTPS address with no");
+            println!("port-forwarding — the easiest option.");
+            if ask_yes("Install Tailscale now?", true) {
+                print_tailscale_install();
+                println!("After installing and running `tailscale up`, re-run `doorman init`.");
+            }
+            println!("Or, if you already have a public HTTPS address for this machine:");
+            (ask_public_url(), None)
+        }
+    }
+}
+
+fn ask_public_url() -> String {
+    prompt(
+        "  Public HTTPS URL for this machine (e.g. https://mcp.example.com)",
+        None,
+    )
+    .trim_end_matches('/')
+    .to_string()
+}
+
+fn print_tailscale_install() {
+    if cfg!(target_os = "linux") {
+        println!("  curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up");
+    } else if cfg!(target_os = "macos") {
+        println!("  brew install tailscale && sudo tailscale up   (or install the Mac app)");
+    } else {
+        println!("  Install from https://tailscale.com/download, then run `tailscale up`.");
+    }
+}
+
+/// Ask a yes/no question with a default; returns the boolean.
+fn ask_yes(question: &str, default_yes: bool) -> bool {
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let ans = prompt(
+        &format!("{question} {hint}"),
+        Some(if default_yes { "y" } else { "n" }),
+    );
+    ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
+}
+
+/// Write an instance's config.toml (0600), creating the instance dir.
+fn write_config(name: &str, kv: &[(String, String)]) {
+    let dir = instance_dir(name);
+    std::fs::create_dir_all(&dir).expect("create instance dir");
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = String::new();
+    for (k, v) in kv {
+        out.push_str(&format!("{k} = \"{}\"\n", esc(v)));
+    }
+    let path = config_path(name);
+    std::fs::write(&path, out).expect("write config.toml");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 fn prompt(label: &str, default: Option<&str>) -> String {
@@ -390,26 +606,54 @@ fn prompt(label: &str, default: Option<&str>) -> String {
 // doctor — end-to-end diagnostics
 // ---------------------------------------------------------------------------
 
-async fn doctor() {
-    let cfg = Config::load();
+async fn doctor(name: &str) {
+    if !config_path(name).exists() {
+        eprintln!("No instance '{name}'. Run: doorman init {name}   (or `doorman list`)");
+        std::process::exit(1);
+    }
+    let cfg = Config::load(name);
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("http client");
     let mut ok = true;
-    println!("doorman doctor — checking {}\n", cfg.issuer);
+    println!("doorman doctor [{name}] — checking {}\n", cfg.issuer);
 
-    // 1. Upstream reachable.
+    // 0. Funnel: if this instance uses a Tailscale Funnel port, is it serving?
+    if let Some(fp) = cfg.funnel_port {
+        let funnel_ok = std::process::Command::new("tailscale")
+            .args(["funnel", "status"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&fp.to_string()))
+            .unwrap_or(false);
+        if funnel_ok {
+            report(true, &format!("Tailscale Funnel is serving port {fp}"), "");
+        } else {
+            ok = false;
+            report(
+                false,
+                &format!("Tailscale Funnel not serving port {fp}"),
+                &format!("bring it up: doorman funnel-cmd {name}"),
+            );
+        }
+    }
+
+    // 1. Upstream reachable (whether spawned by doorman or external).
     let upstream_url = format!("{}{}", cfg.upstream, cfg.upstream_path);
     match http.get(&upstream_url).send().await {
         Ok(_) => report(true, &format!("upstream reachable ({upstream_url})"), ""),
         Err(_) => {
             ok = false;
+            let fix = if cfg.spawn_cmd.is_some() {
+                "doorman couldn't reach the server it runs — check the spawn command and port in the config"
+            } else {
+                "start your MCP server, or fix upstream_url / upstream_path in the config"
+            };
             report(
                 false,
                 &format!("upstream unreachable ({upstream_url})"),
-                "start the upstream, or fix DOORMAN_UPSTREAM_URL / _PATH",
+                fix,
             );
         }
     }
@@ -434,7 +678,9 @@ async fn doctor() {
         report(
             false,
             "discovery document not reachable at the public issuer URL",
-            "is `doorman run` up, and is the tunnel/DNS pointing at it? check DOORMAN_ISSUER_URL",
+            &format!(
+                "is `doorman run {name}` up, and is the tunnel pointing at it? check issuer_url"
+            ),
         );
     }
 
@@ -578,12 +824,116 @@ async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> bool {
 // funnel-cmd — print the exact tunnel command
 // ---------------------------------------------------------------------------
 
-fn funnel_cmd() {
-    let cfg = Config::load();
+// ---------------------------------------------------------------------------
+// delete / list
+// ---------------------------------------------------------------------------
+
+fn delete(name: &str) {
+    if !config_path(name).exists() {
+        eprintln!("No instance '{name}'. `doorman list` shows configured instances.");
+        std::process::exit(1);
+    }
+    // Read funnel_port tolerantly (don't require a complete config to delete).
+    let funnel_port: Option<u16> = std::fs::read_to_string(config_path(name))
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .and_then(|t| {
+            t.get("funnel_port")
+                .and_then(|v| v.as_str())
+                .and_then(|p| p.parse().ok())
+        });
+
+    if !ask_yes(
+        &format!(
+            "Delete '{name}' — stop its service, turn off its funnel, and remove {}? This can't be undone.",
+            instance_dir(name).display()
+        ),
+        false,
+    ) {
+        println!("Aborted.");
+        return;
+    }
+
+    remove_service(name);
+    if let Some(fp) = funnel_port {
+        run_cmd("tailscale", &["funnel", &format!("--https={fp}"), "off"]);
+        println!("Turned off Tailscale Funnel port {fp}.");
+    }
+    match std::fs::remove_dir_all(instance_dir(name)) {
+        Ok(_) => println!("Removed {}", instance_dir(name).display()),
+        Err(e) => eprintln!("Could not remove {}: {e}", instance_dir(name).display()),
+    }
+    println!("\nDone. Remember to also remove the connector for '{name}' inside Claude.");
+}
+
+/// Stop and remove the instance's service, tolerating "not installed" quietly.
+fn remove_service(name: &str) {
+    use std::process::Stdio;
+    // Best-effort: a not-installed service is fine, so swallow its complaints.
+    let quiet = |cmd: &str, args: &[&str]| {
+        let _ = std::process::Command::new(cmd)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    let id = service_id(name);
+    if cfg!(target_os = "linux") {
+        let unit = format!("{id}.service");
+        quiet("systemctl", &["--user", "disable", "--now", &unit]);
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = std::fs::remove_file(format!("{home}/.config/systemd/user/{unit}"));
+        }
+        quiet("systemctl", &["--user", "daemon-reload"]);
+    } else if cfg!(target_os = "macos") {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = format!("{home}/Library/LaunchAgents/dev.{id}.plist");
+            quiet("launchctl", &["unload", &path]);
+            let _ = std::fs::remove_file(&path);
+        }
+    } else if cfg!(target_os = "windows") {
+        quiet("schtasks", &["/delete", "/tn", &id, "/f"]);
+    }
+}
+
+fn list() {
+    use std::net::TcpStream;
+    let names = instance_names();
+    if names.is_empty() {
+        println!("No instances yet. Create one with:  doorman init");
+        return;
+    }
+    println!("{:<12} {:<9} {:<7} URL", "NAME", "STATUS", "FUNNEL");
+    for n in &names {
+        let t = std::fs::read_to_string(config_path(n))
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .unwrap_or_default();
+        let get = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let issuer = get("issuer_url");
+        let fp = t.get("funnel_port").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = get("bind")
+            .parse::<SocketAddr>()
+            .ok()
+            .and_then(|a| {
+                TcpStream::connect_timeout(&a, std::time::Duration::from_millis(200)).ok()
+            })
+            .map(|_| "running")
+            .unwrap_or("stopped");
+        println!("{n:<12} {status:<9} {fp:<7} {issuer}/mcp");
+    }
+}
+
+fn funnel_cmd(name: &str) {
+    let cfg = Config::load(name);
     let port = cfg.bind.rsplit(':').next().unwrap_or("8080");
-    println!("Expose doorman (listening on {}) publicly:\n", cfg.bind);
+    let fp = cfg.funnel_port.unwrap_or(443);
+    println!(
+        "Expose '{}' (listening on {}) publicly:\n",
+        cfg.name, cfg.bind
+    );
     println!("Tailscale Funnel (no DNS, no open ports):");
-    println!("  tailscale funnel --bg {port}\n");
+    println!("  tailscale funnel --bg --https={fp} {port}\n");
     println!("Cloudflare Tunnel — add to your config.yml ingress:");
     println!("  ingress:");
     println!("    - hostname: <your-hostname>");
@@ -592,47 +942,118 @@ fn funnel_cmd() {
     println!("  then: cloudflared tunnel run <tunnel-name>");
 }
 
-/// If Tailscale is installed, offer to bring the Funnel up now; otherwise point the
-/// way. Called from `init`; safe to skip.
-fn maybe_setup_tailscale(port: &str) {
+// ---------------------------------------------------------------------------
+// Instances, ports, Tailscale
+// ---------------------------------------------------------------------------
+
+/// Names of all configured instances (dirs under the root that contain a config.toml).
+fn instance_names() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root_dir()) {
+        for e in rd.flatten() {
+            if e.path().join("config.toml").exists() {
+                names.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Bind ports and funnel ports already claimed by other instances.
+fn used_ports(exclude: &str) -> (Vec<u16>, Vec<u16>) {
+    let (mut binds, mut funnels) = (Vec::new(), Vec::new());
+    for n in instance_names() {
+        if n == exclude {
+            continue;
+        }
+        if let Ok(s) = std::fs::read_to_string(config_path(&n)) {
+            if let Ok(t) = s.parse::<toml::Table>() {
+                if let Some(p) = t
+                    .get("bind")
+                    .and_then(|v| v.as_str())
+                    .and_then(|b| b.rsplit(':').next())
+                    .and_then(|p| p.parse().ok())
+                {
+                    binds.push(p);
+                }
+                if let Some(f) = t
+                    .get("funnel_port")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| p.parse().ok())
+                {
+                    funnels.push(f);
+                }
+            }
+        }
+    }
+    (binds, funnels)
+}
+
+/// Pick the next free local bind port (from 8080) and note funnel ports already taken.
+fn assign_ports(name: &str) -> (u16, Vec<u16>) {
+    let (binds, funnels) = used_ports(name);
+    (next_free_bind(&binds), funnels)
+}
+
+fn next_free_bind(used: &[u16]) -> u16 {
+    let mut port = 8080u16;
+    while used.contains(&port) {
+        port += 1;
+    }
+    port
+}
+
+/// The next free Tailscale Funnel port, in Tailscale's fixed set. None if all 3 are taken.
+fn next_funnel_port() -> Option<u16> {
+    let (_binds, funnels) = used_ports("");
+    next_free_funnel(&funnels)
+}
+
+fn next_free_funnel(used: &[u16]) -> Option<u16> {
+    [443u16, 8443, 10000]
+        .into_iter()
+        .find(|p| !used.contains(p))
+}
+
+/// The machine's tailnet DNS name, if Tailscale is up and logged in.
+fn tailscale_dnsname() -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    out.status.success().then_some(())?;
+    parse_tailscale_dnsname(&out.stdout)
+}
+
+/// Extract `Self.DNSName` (trailing dot stripped) from `tailscale status --json` output.
+fn parse_tailscale_dnsname(stdout: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let dns = v
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim_end_matches('.');
+    (!dns.is_empty()).then(|| dns.to_string())
+}
+
+/// Whether the `tailscale` binary is installed (regardless of login state).
+fn tailscale_present() -> bool {
     use std::process::Stdio;
-    let present = std::process::Command::new("tailscale")
+    std::process::Command::new("tailscale")
         .arg("version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    if !present {
-        println!(
-            "\nTailscale not found on PATH. Install it (https://tailscale.com/download), \
-             then run `doorman funnel-cmd`."
-        );
-        return;
-    }
-    let go = prompt(
-        &format!("\nExpose doorman on your tailnet with Tailscale Funnel (port {port}) now? [y/N]"),
-        Some("N"),
-    );
-    if go.eq_ignore_ascii_case("y") {
-        if run_cmd("tailscale", &["funnel", "--bg", port]) {
-            println!(
-                "Funnel is up. Your public URL is your tailnet HTTPS name — make sure it \
-                 matches the issuer_url you configured."
-            );
-        } else {
-            println!("Couldn't start the Funnel automatically; run `doorman funnel-cmd` for the manual command.");
-        }
-    } else {
-        println!("Skipped. Run `doorman funnel-cmd` when you're ready to expose it.");
-    }
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
 // install-service — register doorman to start on boot, per platform
 // ---------------------------------------------------------------------------
 
-fn install_service() {
+fn install_service(name: &str) {
     let exe = match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
         Err(e) => {
@@ -640,26 +1061,25 @@ fn install_service() {
             return;
         }
     };
-    let workdir = match std::env::current_dir() {
-        Ok(p) => p.display().to_string(),
-        Err(e) => {
-            eprintln!("doorman: could not determine working directory: {e}");
-            return;
-        }
-    };
+    let workdir = instance_dir(name).display().to_string();
 
     if cfg!(target_os = "linux") {
-        install_systemd(&exe, &workdir);
+        install_systemd(&exe, &workdir, name);
     } else if cfg!(target_os = "macos") {
-        install_launchd(&exe, &workdir);
+        install_launchd(&exe, &workdir, name);
     } else if cfg!(target_os = "windows") {
-        print_windows_service(&exe, &workdir);
+        print_windows_service(&exe, &workdir, name);
     } else {
-        println!("Automatic service install isn't supported on this OS. Run `doorman run` under your process manager, from {workdir}.");
+        println!("Automatic service install isn't supported on this OS. Run `doorman run {name}` under your process manager.");
     }
 }
 
-fn install_systemd(exe: &str, workdir: &str) {
+/// systemd/launchd/Windows identifier for an instance's service.
+fn service_id(name: &str) -> String {
+    format!("doorman-{name}")
+}
+
+fn install_systemd(exe: &str, workdir: &str, name: &str) {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => {
@@ -667,28 +1087,26 @@ fn install_systemd(exe: &str, workdir: &str) {
             return;
         }
     };
+    let unit = format!("{}.service", service_id(name));
     let dir = format!("{home}/.config/systemd/user");
-    let path = format!("{dir}/doorman.service");
+    let path = format!("{dir}/{unit}");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("doorman: could not create {dir}: {e}");
         return;
     }
-    if let Err(e) = std::fs::write(&path, systemd_unit(exe, workdir)) {
+    if let Err(e) = std::fs::write(&path, systemd_unit(exe, workdir, name)) {
         eprintln!("doorman: could not write {path}: {e}");
         return;
     }
     println!("Wrote {path}");
     run_cmd("systemctl", &["--user", "daemon-reload"]);
-    run_cmd(
-        "systemctl",
-        &["--user", "enable", "--now", "doorman.service"],
-    );
-    println!("Enabled the doorman user service.");
+    run_cmd("systemctl", &["--user", "enable", "--now", &unit]);
+    println!("Enabled the {unit} user service.");
     println!("To keep it running while you're logged out (e.g. a headless Pi), run once:");
     println!("  sudo loginctl enable-linger \"$USER\"");
 }
 
-fn install_launchd(exe: &str, workdir: &str) {
+fn install_launchd(exe: &str, workdir: &str, name: &str) {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => {
@@ -696,14 +1114,14 @@ fn install_launchd(exe: &str, workdir: &str) {
             return;
         }
     };
-    let label = "dev.doorman";
+    let label = format!("dev.{}", service_id(name));
     let dir = format!("{home}/Library/LaunchAgents");
     let path = format!("{dir}/{label}.plist");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("doorman: could not create {dir}: {e}");
         return;
     }
-    if let Err(e) = std::fs::write(&path, launchd_plist(exe, workdir, label)) {
+    if let Err(e) = std::fs::write(&path, launchd_plist(exe, workdir, &label, name)) {
         eprintln!("doorman: could not write {path}: {e}");
         return;
     }
@@ -713,15 +1131,16 @@ fn install_launchd(exe: &str, workdir: &str) {
         .args(["unload", &path])
         .status();
     run_cmd("launchctl", &["load", "-w", &path]);
-    println!("Loaded the doorman LaunchAgent.");
+    println!("Loaded the {label} LaunchAgent.");
 }
 
-fn print_windows_service(exe: &str, workdir: &str) {
+fn print_windows_service(exe: &str, workdir: &str, name: &str) {
+    let task = service_id(name);
     println!("On Windows, register a logon task (run in an elevated prompt):");
-    println!("  schtasks /create /tn doorman /sc onlogon /rl highest \\");
-    println!("    /tr \"cmd /c cd /d \\\"{workdir}\\\" && \\\"{exe}\\\" run\"");
+    println!("  schtasks /create /tn {task} /sc onlogon /rl highest \\");
+    println!("    /tr \"cmd /c cd /d \\\"{workdir}\\\" && \\\"{exe}\\\" run {name}\"");
     println!("\nOr use a service wrapper (nssm / WinSW) pointing at:");
-    println!("  \"{exe}\" run   (working directory: {workdir})");
+    println!("  \"{exe}\" run {name}   (working directory: {workdir})");
 }
 
 /// Run a command inheriting stdio; returns whether it succeeded.
@@ -739,14 +1158,14 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
     }
 }
 
-fn systemd_unit(exe: &str, workdir: &str) -> String {
+fn systemd_unit(exe: &str, workdir: &str, name: &str) -> String {
     format!(
         "[Unit]\n\
-         Description=doorman OAuth gate\n\
+         Description=doorman OAuth gate ({name})\n\
          After=network-online.target\n\
          Wants=network-online.target\n\n\
          [Service]\n\
-         ExecStart={exe} run\n\
+         ExecStart={exe} run {name}\n\
          WorkingDirectory={workdir}\n\
          Restart=on-failure\n\
          RestartSec=2\n\n\
@@ -755,7 +1174,7 @@ fn systemd_unit(exe: &str, workdir: &str) -> String {
     )
 }
 
-fn launchd_plist(exe: &str, workdir: &str, label: &str) -> String {
+fn launchd_plist(exe: &str, workdir: &str, label: &str, name: &str) -> String {
     let x = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -768,7 +1187,7 @@ fn launchd_plist(exe: &str, workdir: &str, label: &str) -> String {
 <dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
-  <array><string>{exe}</string><string>run</string></array>
+  <array><string>{exe}</string><string>run</string><string>{name}</string></array>
   <key>WorkingDirectory</key><string>{workdir}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -777,6 +1196,7 @@ fn launchd_plist(exe: &str, workdir: &str, label: &str) -> String {
 "#,
         exe = x(exe),
         workdir = x(workdir),
+        name = x(name),
     )
 }
 
@@ -1521,6 +1941,9 @@ mod tests {
             refresh_ttl: 3600,
             code_ttl: 120,
             rate_limit: 0,
+            spawn_cmd: None,
+            funnel_port: None,
+            name: "test".into(),
         }
     }
 
@@ -2136,8 +2559,8 @@ mod tests {
 
     #[test]
     fn systemd_unit_runs_the_binary_from_the_workdir() {
-        let u = systemd_unit("/usr/bin/doorman", "/var/lib/doorman");
-        assert!(u.contains("ExecStart=/usr/bin/doorman run"));
+        let u = systemd_unit("/usr/bin/doorman", "/var/lib/doorman", "picnic");
+        assert!(u.contains("ExecStart=/usr/bin/doorman run picnic"));
         assert!(u.contains("WorkingDirectory=/var/lib/doorman"));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains("[Install]"));
@@ -2145,12 +2568,43 @@ mod tests {
 
     #[test]
     fn launchd_plist_is_well_formed_and_xml_escaped() {
-        let p = launchd_plist("/opt/doorman & co/doorman", "/home/me", "dev.doorman");
-        assert!(p.contains("<key>Label</key><string>dev.doorman</string>"));
-        assert!(p.contains("<string>run</string>"));
+        let p = launchd_plist(
+            "/opt/doorman & co/doorman",
+            "/home/me",
+            "dev.doorman-n8n",
+            "n8n",
+        );
+        assert!(p.contains("<key>Label</key><string>dev.doorman-n8n</string>"));
+        assert!(p.contains("<string>run</string><string>n8n</string>"));
         assert!(p.contains("<key>RunAtLoad</key><true/>"));
         // the & in the path must be escaped for valid XML
         assert!(p.contains("/opt/doorman &amp; co/doorman"));
         assert!(!p.contains("doorman & co"));
+    }
+
+    #[test]
+    fn bind_port_picks_the_next_free_slot() {
+        assert_eq!(next_free_bind(&[]), 8080);
+        assert_eq!(next_free_bind(&[8080]), 8081);
+        assert_eq!(next_free_bind(&[8080, 8081, 8083]), 8082);
+    }
+
+    #[test]
+    fn funnel_ports_follow_tailscales_fixed_set_and_run_out() {
+        assert_eq!(next_free_funnel(&[]), Some(443));
+        assert_eq!(next_free_funnel(&[443]), Some(8443));
+        assert_eq!(next_free_funnel(&[443, 8443]), Some(10000));
+        assert_eq!(next_free_funnel(&[443, 8443, 10000]), None);
+    }
+
+    #[test]
+    fn parses_tailnet_name_and_strips_trailing_dot() {
+        let json = br#"{"Self":{"DNSName":"pi.tailXXXX.ts.net."}}"#;
+        assert_eq!(
+            parse_tailscale_dnsname(json).as_deref(),
+            Some("pi.tailXXXX.ts.net")
+        );
+        assert_eq!(parse_tailscale_dnsname(b"{}"), None);
+        assert_eq!(parse_tailscale_dnsname(b"not json"), None);
     }
 }

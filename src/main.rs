@@ -661,20 +661,26 @@ async fn doctor(name: &str) {
     println!("doorman doctor [{name}] — checking {}\n", cfg.issuer);
 
     // 0. Funnel: if this instance uses a Tailscale Funnel port, is it serving?
+    // Match on the local target (`proxy http://127.0.0.1:<port>`) rather than the funnel
+    // port — port 443 is implicit in the status URL and wouldn't appear literally.
     if let Some(fp) = cfg.funnel_port {
         let funnel_ok = std::process::Command::new("tailscale")
             .args(["funnel", "status"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&fp.to_string()))
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&cfg.bind))
             .unwrap_or(false);
         if funnel_ok {
-            report(true, &format!("Tailscale Funnel is serving port {fp}"), "");
+            report(
+                true,
+                &format!("Tailscale Funnel is serving this instance (port {fp})"),
+                "",
+            );
         } else {
             ok = false;
             report(
                 false,
-                &format!("Tailscale Funnel not serving port {fp}"),
-                &format!("bring it up: doorman funnel-cmd {name}"),
+                &format!("Tailscale Funnel not serving this instance (port {fp} → {})", cfg.bind),
+                &format!("bring it up: doorman funnel-cmd {name}  (and check Funnel is enabled in the Tailscale admin console)"),
             );
         }
     }

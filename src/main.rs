@@ -393,16 +393,19 @@ fn init(name: &str) {
             "  Command that starts your MCP server (e.g. npx -y mcp-picnic --enable-http --http-port 3000)",
             None,
         );
-        let uport = prompt("  Which port does it listen on?", Some("3000"));
-        let upath = prompt("  What path is the MCP endpoint on?", Some("/mcp"));
+        let uport = prompt("  Which port does it listen on? [3000]", Some("3000"));
+        let upath = prompt("  What path is the MCP endpoint on? [/mcp]", Some("/mcp"));
         println!("  → doorman will run it on localhost where only doorman can reach it, so no upstream token is needed.");
         cfg.push(("spawn_cmd".into(), spawn_cmd));
         cfg.push(("upstream_url".into(), format!("http://127.0.0.1:{uport}")));
         cfg.push(("upstream_path".into(), upath));
     } else {
         println!("  OK — point doorman at your already-running server.");
-        let url = prompt("  Upstream URL", Some("http://127.0.0.1:3000"));
-        let upath = prompt("  MCP path", Some("/mcp"));
+        let url = prompt(
+            "  Upstream URL [http://127.0.0.1:3000]",
+            Some("http://127.0.0.1:3000"),
+        );
+        let upath = prompt("  MCP path [/mcp]", Some("/mcp"));
         cfg.push(("upstream_url".into(), url));
         cfg.push(("upstream_path".into(), upath));
         if ask_yes(
@@ -410,7 +413,7 @@ fn init(name: &str) {
             false,
         ) {
             let header = prompt(
-                "    Header name — Authorization (Bearer) | both | <custom, e.g. x-mcp-token>",
+                "    Header name — Authorization (Bearer) | both | <custom, e.g. x-mcp-token> [Authorization]",
                 Some("Authorization"),
             );
             let token = prompt("    Token value", None);
@@ -496,41 +499,71 @@ fn init(name: &str) {
 /// Decide the public HTTPS address: automate via Tailscale when possible, else ask.
 /// Returns (issuer_url, funnel_port).
 fn choose_public_address() -> (String, Option<u16>) {
-    match tailscale_dnsname() {
-        Some(dns) => {
-            let fp = next_funnel_port();
-            match fp {
-                Some(fp) => {
-                    let issuer = if fp == 443 {
-                        format!("https://{dns}")
-                    } else {
-                        format!("https://{dns}:{fp}")
-                    };
-                    println!(
-                        "Tailscale is set up. doorman will expose this instance at:\n  {issuer}"
-                    );
-                    (issuer, Some(fp))
-                }
-                None => {
-                    println!("All 3 Tailscale Funnel ports are already in use by other instances.");
-                    (ask_public_url(), None)
-                }
-            }
+    if let Some(res) = try_tailscale() {
+        return res;
+    }
+    // Tailscale declined or unavailable — take a public address the user already has.
+    println!("\nNo Tailscale — enter a public HTTPS address you already have for this machine");
+    println!("(e.g. your own domain behind a reverse proxy).");
+    (ask_public_url(), None)
+}
+
+/// Try to set the address up via Tailscale, guiding install/login and waiting for the
+/// user to finish (re-checking after each Enter). Returns None if it can't be used, so
+/// the caller falls back to a manual URL — we never ask for a URL mid-setup.
+fn try_tailscale() -> Option<(String, Option<u16>)> {
+    // Already up and logged in.
+    if tailscale_dnsname().is_some() {
+        return finalize_tailscale();
+    }
+    // Offer the Tailscale route (once), guiding install/login as needed.
+    if tailscale_present() {
+        println!("\nTailscale is installed but not logged in.");
+        if !ask_yes(
+            "Log in with `sudo tailscale up` (in another terminal) and use it?",
+            true,
+        ) {
+            return None;
         }
-        None if tailscale_present() => {
-            println!("Tailscale is installed but not logged in. Run `tailscale up` to log in,");
-            println!("then re-run `doorman init`. For now, enter your public address manually:");
-            (ask_public_url(), None)
+    } else {
+        println!("\nTailscale gives you a free public HTTPS address with no port-forwarding.");
+        if !ask_yes("Set doorman up to use Tailscale?", true) {
+            return None;
+        }
+        println!("Install it, then log in:");
+        print_tailscale_install();
+    }
+    // Guide-then-wait: re-check after each Enter, up to a few tries.
+    for _ in 0..3 {
+        prompt(
+            "Press Enter once Tailscale is installed and `tailscale up` has logged you in",
+            Some(""),
+        );
+        if tailscale_dnsname().is_some() {
+            return finalize_tailscale();
+        }
+        println!("Tailscale still isn't reachable.");
+    }
+    println!("Giving up on Tailscale for now.");
+    None
+}
+
+/// Derive the issuer + funnel port once Tailscale is confirmed up.
+fn finalize_tailscale() -> Option<(String, Option<u16>)> {
+    let dns = tailscale_dnsname()?;
+    match next_funnel_port() {
+        Some(fp) => {
+            let issuer = if fp == 443 {
+                format!("https://{dns}")
+            } else {
+                format!("https://{dns}:{fp}")
+            };
+            println!("Tailscale is ready. doorman will expose this instance at:\n  {issuer}");
+            Some((issuer, Some(fp)))
         }
         None => {
-            println!("Tailscale isn't installed. It gives you a free public HTTPS address with no");
-            println!("port-forwarding — the easiest option.");
-            if ask_yes("Install Tailscale now?", true) {
-                print_tailscale_install();
-                println!("After installing and running `tailscale up`, re-run `doorman init`.");
-            }
-            println!("Or, if you already have a public HTTPS address for this machine:");
-            (ask_public_url(), None)
+            println!("All 3 Tailscale Funnel ports are already in use by other instances.");
+            None
         }
     }
 }
@@ -1126,9 +1159,12 @@ fn install_launchd(exe: &str, workdir: &str, name: &str) {
         return;
     }
     println!("Wrote {path}");
-    // Reload cleanly: unload if it was already loaded, then load.
+    // Reload cleanly: unload first in case it's already loaded. Silence its complaint
+    // when it isn't (a harmless "Unload failed" otherwise prints on a fresh install).
     let _ = std::process::Command::new("launchctl")
         .args(["unload", &path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     run_cmd("launchctl", &["load", "-w", &path]);
     println!("Loaded the {label} LaunchAgent.");

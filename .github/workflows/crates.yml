@@ -1,0 +1,19 @@
+name: crates.io
+
+# cargo-dist handles binaries + Homebrew + the shell installer; this publishes the
+# crate so `cargo install doorman` works too. Runs on the same version tags.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

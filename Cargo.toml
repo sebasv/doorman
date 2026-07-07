@@ -5,6 +5,7 @@ edition = "2021"
 description = "Front any static-token or no-auth HTTP service with the OAuth 2.1 flow Claude requires — in one binary. No IdP, no database."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sebasv/doorman"
+homepage = "https://github.com/sebasv/doorman"
 readme = "README.md"
 keywords = ["oauth", "mcp", "proxy", "claude", "gateway"]
 categories = ["command-line-utilities", "web-programming"]
@@ -27,3 +28,8 @@ toml = "1.1.2"
 strip = true
 lto = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

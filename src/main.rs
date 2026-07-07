@@ -83,7 +83,9 @@ impl Config {
         let g = |k: &str| get_cfg(&file, k);
         let issuer = g("issuer_url")
             .unwrap_or_else(|| {
-                panic!("issuer_url not set for instance '{name}'. Run: doorman init {name}")
+                die(format!(
+                    "issuer_url not set for instance '{name}'. Run: doorman init {name}"
+                ))
             })
             .trim_end_matches('/')
             .to_string();
@@ -105,7 +107,9 @@ impl Config {
             // password means anyone who reaches the consent page can approve — so we
             // refuse to start silently if it is not present at all.
             owner_password: get_cfg_present(&file, "owner_password").unwrap_or_else(|| {
-                panic!("owner_password not set for '{name}'. Run: doorman init {name}")
+                die(format!(
+                    "owner_password not set for '{name}'. Run: doorman init {name}"
+                ))
             }),
             allowed_redirects: g("allowed_redirect_uris")
                 .unwrap_or_else(|| "https://claude.ai/api/mcp/auth_callback".into())
@@ -154,16 +158,37 @@ fn config_path(name: &str) -> std::path::PathBuf {
     instance_dir(name).join("config.toml")
 }
 
+/// Instance names are used as path segments and as service/unit identifiers, so they
+/// must be a safe, injection-free charset: letters, digits, '-', '_', 1..=64 chars.
+/// This rejects path traversal ("..", "/", absolute paths) and shell/systemd/XML
+/// metacharacters at the boundary.
+fn is_valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn load_toml(name: &str) -> toml::Table {
     let path = std::env::var("DOORMAN_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| config_path(name));
     match std::fs::read_to_string(&path) {
-        Ok(s) => s
-            .parse()
-            .unwrap_or_else(|e| panic!("{} is present but not valid TOML: {e}", path.display())),
+        Ok(s) => s.parse().unwrap_or_else(|e| {
+            die(format!(
+                "{} is present but not valid TOML: {e}",
+                path.display()
+            ))
+        }),
         Err(_) => toml::Table::new(),
     }
+}
+
+/// Print a clean error and exit non-zero (no panic backtrace for user-facing failures).
+fn die(msg: String) -> ! {
+    eprintln!("doorman: {msg}");
+    std::process::exit(1);
 }
 
 /// env DOORMAN_<UPPER> (non-empty) beats the toml key beats absent.
@@ -237,6 +262,9 @@ struct RefreshClaims {
     iat: u64,
     #[serde(rename = "use")]
     token_use: String,
+    /// The client this refresh token was issued to; a refresh may only be
+    /// redeemed by that same client (so a token can't be replayed by another).
+    client_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +281,19 @@ async fn main() {
         .map(String::as_str)
         .unwrap_or("default")
         .to_string();
+    // Instance names become path segments and service/unit identifiers, so keep them to
+    // a safe charset — rejects path traversal (../, absolute paths) and shell/unit
+    // metacharacters before they can reach the filesystem, systemd, or schtasks.
+    let name_scoped = matches!(
+        cmd,
+        "run" | "init" | "doctor" | "delete" | "funnel-cmd" | "install-service"
+    );
+    if name_scoped && !is_valid_instance_name(&name) {
+        eprintln!(
+            "doorman: invalid instance name '{name}' — use letters, digits, '-' or '_' (max 64)."
+        );
+        std::process::exit(2);
+    }
     match cmd {
         "run" => run(&name).await,
         "init" => init(&name),
@@ -316,22 +357,43 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Handle for a supervised upstream child. Dropping it aborts the supervisor loop;
-/// the running child is killed via `kill_on_drop`.
-struct ChildGuard(tokio::task::JoinHandle<()>);
+/// Handle for a supervised upstream child. Dropping it stops the supervisor loop and,
+/// on Unix, kills the child's whole process group so grandchildren (e.g. npx → node)
+/// die too rather than orphaning.
+struct ChildGuard {
+    handle: tokio::task::JoinHandle<()>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// PID of the current child (== process-group id, since we make it a group leader).
+    pgid: Arc<Mutex<Option<u32>>>,
+}
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(unix)]
+        if let Some(pid) = *self.pgid.lock().unwrap() {
+            // SIGTERM the whole group (negative pid) — reaps the shell and its children.
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        self.handle.abort();
     }
 }
 
-/// Spawn the upstream via the shell and keep it alive, restarting on exit.
-/// ponytail: kill_on_drop kills the shell child on shutdown; under a service manager
-/// (systemd/launchd) the whole process tree is reaped by the unit anyway. Process-group
-/// kill is the upgrade path if orphaned grandchildren become a problem in foreground use.
+/// Spawn the upstream via the shell and keep it alive, restarting on exit until shutdown.
 fn spawn_supervised(cmd: String) -> ChildGuard {
-    ChildGuard(tokio::spawn(async move {
+    use std::sync::atomic::Ordering;
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pgid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let (sd, pg) = (shutdown.clone(), pgid.clone());
+    let handle = tokio::spawn(async move {
         loop {
+            if sd.load(Ordering::SeqCst) {
+                break;
+            }
             let mut c = if cfg!(target_os = "windows") {
                 let mut c = tokio::process::Command::new("cmd");
                 c.arg("/C").arg(&cmd);
@@ -341,10 +403,18 @@ fn spawn_supervised(cmd: String) -> ChildGuard {
                 c.arg("-c").arg(&cmd);
                 c
             };
+            // Run the child as its own process-group leader so we can signal the group.
+            #[cfg(unix)]
+            c.process_group(0);
             match c.kill_on_drop(true).spawn() {
                 Ok(mut child) => {
+                    *pg.lock().unwrap() = child.id();
                     eprintln!("doorman: started upstream: {cmd}");
                     let status = child.wait().await;
+                    *pg.lock().unwrap() = None;
+                    if sd.load(Ordering::SeqCst) {
+                        break;
+                    }
                     eprintln!("doorman: upstream exited ({status:?}); restarting in 2s");
                 }
                 Err(e) => {
@@ -353,7 +423,12 @@ fn spawn_supervised(cmd: String) -> ChildGuard {
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-    }))
+    });
+    ChildGuard {
+        handle,
+        shutdown,
+        pgid,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,13 +688,21 @@ fn write_config(name: &str, kv: &[(String, String)]) {
     for (k, v) in kv {
         out.push_str(&format!("{k} = \"{}\"\n", esc(v)));
     }
-    let path = config_path(name);
-    std::fs::write(&path, out).expect("write config.toml");
+    write_secret_file(&config_path(name), out.as_bytes()).expect("write config.toml");
+}
+
+/// Write a 0600 file atomically: write a temp sibling, chmod it, then rename over the
+/// target. A crash mid-write leaves the old file intact instead of a truncated one that
+/// would panic on the next load.
+fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
+    std::fs::rename(&tmp, path)
 }
 
 fn prompt(label: &str, default: Option<&str>) -> String {
@@ -1280,7 +1363,9 @@ fn build_state(cfg: Config) -> AppState {
 fn load_clients(path: &str) -> HashMap<String, Client> {
     match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            panic!("clients file {path} is present but unparseable: {e} — fix or remove it")
+            die(format!(
+                "clients file {path} is present but unparseable: {e} — fix or remove it"
+            ))
         }),
         Err(_) => HashMap::new(),
     }
@@ -1288,17 +1373,12 @@ fn load_clients(path: &str) -> HashMap<String, Client> {
 
 /// Write-through persistence for the client registry. Best-effort: a failed write is
 /// logged, not fatal — the in-memory registry is still authoritative for this run.
+/// Written atomically so a crash can't leave a truncated file that panics on restart.
 fn save_clients(path: &str, clients: &HashMap<String, Client>) {
     match serde_json::to_string_pretty(clients) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
+            if let Err(e) = write_secret_file(std::path::Path::new(path), json.as_bytes()) {
                 eprintln!("doorman: warning: could not persist clients to {path}: {e}");
-                return;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
             }
         }
         Err(e) => eprintln!("doorman: warning: could not serialize clients: {e}"),
@@ -1445,11 +1525,14 @@ async fn register(State(s): State<AppState>, Json(r): Json<RegisterReq>) -> Resp
 }
 
 /// Registered redirect URIs must be HTTPS (or localhost for dev) — never a scheme like
-/// javascript: or an arbitrary custom scheme.
+/// javascript: or an arbitrary custom scheme — and must contain no control characters
+/// or whitespace (which would otherwise land in the `Location` header verbatim and
+/// could inject a header / panic the responder).
 fn is_valid_redirect(u: &str) -> bool {
-    u.starts_with("https://")
+    let scheme_ok = u.starts_with("https://")
         || u.starts_with("http://localhost")
-        || u.starts_with("http://127.0.0.1")
+        || u.starts_with("http://127.0.0.1");
+    scheme_ok && !u.bytes().any(|b| b.is_ascii_control() || b == b' ')
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,7 +1755,9 @@ async fn token(State(s): State<AppState>, headers: HeaderMap, Form(t): Form<Toke
             v.set_issuer(std::slice::from_ref(&s.cfg.issuer));
             v.set_audience(std::slice::from_ref(&s.cfg.issuer));
             match decode::<RefreshClaims>(&rt, &s.dec, &v) {
-                Ok(data) if data.claims.token_use == "refresh" => {
+                // Must be a refresh token AND belong to the client presenting it —
+                // otherwise a client could replay another client's refresh token.
+                Ok(data) if data.claims.token_use == "refresh" && data.claims.client_id == cid => {
                     issue_tokens(&s, &s.cfg.resource.clone(), &cid)
                 }
                 _ => oauth_err(StatusCode::BAD_REQUEST, "invalid_grant"),
@@ -1700,6 +1785,7 @@ fn issue_tokens(s: &AppState, audience: &str, client_id: &str) -> Response {
         exp: iat + s.cfg.refresh_ttl,
         iat,
         token_use: "refresh".into(),
+        client_id: client_id.to_string(),
     };
     let hdr = Header::new(Algorithm::RS256);
     let access_token = encode(&hdr, &access, &s.enc).expect("sign access");
@@ -2655,5 +2741,94 @@ mod tests {
         );
         assert_eq!(parse_tailscale_dnsname(b"{}"), None);
         assert_eq!(parse_tailscale_dnsname(b"not json"), None);
+    }
+
+    #[test]
+    fn instance_names_reject_traversal_and_junk() {
+        assert!(is_valid_instance_name("default"));
+        assert!(is_valid_instance_name("n8n"));
+        assert!(is_valid_instance_name("my-app_2"));
+        assert!(!is_valid_instance_name("")); // empty
+        assert!(!is_valid_instance_name("..")); // traversal
+        assert!(!is_valid_instance_name("../evil")); // traversal
+        assert!(!is_valid_instance_name("/etc/x")); // absolute
+        assert!(!is_valid_instance_name("a/b")); // separator
+        assert!(!is_valid_instance_name("a b")); // space
+        assert!(!is_valid_instance_name("a\nb")); // newline (systemd unit injection)
+        assert!(!is_valid_instance_name(&"x".repeat(65))); // too long
+    }
+
+    #[test]
+    fn redirect_validation_rejects_control_chars() {
+        assert!(is_valid_redirect("https://claude.ai/api/mcp/auth_callback"));
+        assert!(is_valid_redirect("http://localhost:1234/cb"));
+        assert!(!is_valid_redirect("http://evil.example/cb")); // non-https, non-local
+        assert!(!is_valid_redirect("javascript:alert(1)"));
+        assert!(!is_valid_redirect("https://ok/cb\r\nSet-Cookie: x")); // CRLF injection
+        assert!(!is_valid_redirect("https://ok/cb with space"));
+        assert!(!is_valid_redirect("https://ok/cb\u{0}")); // NUL
+    }
+
+    #[tokio::test]
+    async fn refresh_token_is_bound_to_its_client() {
+        let (stub, _cap) = spawn_stub().await;
+        let base = spawn_doorman(test_cfg(&stub)).await;
+        let c = client();
+
+        // Client A (the pre-registered env client) obtains a refresh token.
+        let (verifier, challenge) = pkce();
+        let code = code_for(&c, &base, "cid", &challenge).await;
+        let tok: serde_json::Value = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let refresh = tok["refresh_token"].as_str().unwrap().to_string();
+
+        // Client B (DCR-registered, confidential) must NOT be able to redeem A's refresh.
+        let reg = dcr_register(&c, &base, None).await;
+        let bid = reg["client_id"].as_str().unwrap().to_string();
+        let bsecret = reg["client_secret"].as_str().unwrap().to_string();
+        let stolen = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &bid),
+                ("client_secret", &bsecret),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            stolen.status(),
+            400,
+            "another client must not redeem A's refresh token"
+        );
+
+        // Client A redeeming its own refresh still works.
+        let ok = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
     }
 }

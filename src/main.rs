@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
@@ -68,6 +68,11 @@ struct Config {
     code_ttl: u64,
     /// Max requests per IP per minute on /authorize and /token. 0 disables limiting.
     rate_limit: u32,
+    /// Minimum spacing, in milliseconds, between successive proxied requests to the
+    /// upstream. A single global pacer: it delays (never rejects) so a burst of MCP
+    /// calls is spread out, keeping the upstream's own rate-limited API (e.g. Picnic,
+    /// which temp-bans the source IP on bursts) below its threshold. 0 disables pacing.
+    proxy_min_interval_ms: u64,
     /// Command doorman runs and supervises as the upstream (localhost). None ⇒ external upstream.
     spawn_cmd: Option<String>,
     /// Tailscale Funnel port this instance uses (443/8443/10000), if any — for doctor/delete.
@@ -128,6 +133,9 @@ impl Config {
                 .unwrap_or(120)
                 .min(120),
             rate_limit: g("rate_limit").and_then(|v| v.parse().ok()).unwrap_or(30),
+            proxy_min_interval_ms: g("proxy_min_interval_ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             spawn_cmd: g("spawn_cmd"),
             funnel_port: g("funnel_port").and_then(|v| v.parse().ok()),
             issuer,
@@ -220,6 +228,9 @@ struct Inner {
     clients: Mutex<HashMap<String, Client>>,
     /// Per-IP fixed-window counters for the auth endpoints: ip -> (window_start, count).
     limits: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    /// Earliest instant the next proxied upstream request may start — the state behind
+    /// the global proxy pacer (see `proxy_min_interval_ms`).
+    proxy_gate: Mutex<Instant>,
     http: reqwest::Client,
 }
 type AppState = Arc<Inner>;
@@ -1356,6 +1367,7 @@ fn build_state(cfg: Config) -> AppState {
         codes: Mutex::new(HashMap::new()),
         clients: Mutex::new(clients),
         limits: Mutex::new(HashMap::new()),
+        proxy_gate: Mutex::new(Instant::now()),
         cfg,
     })
 }
@@ -1829,6 +1841,25 @@ async fn proxy(
         return unauthorized(&s);
     }
 
+    // 1b. Pace calls to the upstream. One global gate spaced by proxy_min_interval_ms:
+    // doorman fronts a single upstream, so every proxied request lands on the same
+    // remote IP regardless of caller — a global minimum interval is what actually caps
+    // the rate that upstream's API sees. Compute the wait under the lock, then release
+    // before sleeping so the gate is never held across an await.
+    if s.cfg.proxy_min_interval_ms > 0 {
+        let interval = Duration::from_millis(s.cfg.proxy_min_interval_ms);
+        let wait = {
+            let mut gate = s.proxy_gate.lock().unwrap();
+            let now = Instant::now();
+            let slot = (*gate).max(now);
+            *gate = slot + interval;
+            slot.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     // 2. Forward to the upstream, injecting the downstream credential.
     // ponytail: doorman fronts a single MCP endpoint, so every request is routed to
     // the configured upstream path (carrying the query string) rather than mirroring
@@ -2076,6 +2107,7 @@ mod tests {
             refresh_ttl: 3600,
             code_ttl: 120,
             rate_limit: 0,
+            proxy_min_interval_ms: 0,
             spawn_cmd: None,
             funnel_port: None,
             name: "test".into(),
@@ -2236,6 +2268,65 @@ mod tests {
             .unwrap();
         assert_eq!(asm["code_challenge_methods_supported"][0], "S256");
         assert_eq!(asm["token_endpoint"], "https://test.doorman/token");
+    }
+
+    /// Mint a valid access token against a running doorman instance.
+    async fn mint_access(c: &reqwest::Client, base: &str) -> String {
+        let (verifier, challenge) = pkce();
+        let code = get_code(c, base, &challenge, "hunter2").await;
+        let code = qp(code.location.as_ref().unwrap(), "code").unwrap();
+        let tok: serde_json::Value = c
+            .post(format!("{base}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", &verifier),
+                ("client_id", "cid"),
+                ("client_secret", "csec"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tok["access_token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn proxy_paces_concurrent_upstream_calls() {
+        let (stub, _cap) = spawn_stub().await;
+        let mut cfg = test_cfg(&stub);
+        cfg.proxy_min_interval_ms = 150;
+        let base = spawn_doorman(cfg).await;
+        let c = client();
+        let access = mint_access(&c, &base).await;
+
+        // Fire 4 requests concurrently; the global gate must serialize them to at least
+        // 3 * interval apart (first is free, the next three each wait a full interval).
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let (c, base, access) = (c.clone(), base.clone(), access.clone());
+            handles.push(tokio::spawn(async move {
+                c.post(format!("{base}/mcp"))
+                    .bearer_auth(&access)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), 200);
+        }
+        assert!(
+            start.elapsed() >= Duration::from_millis(3 * 150),
+            "4 paced calls took {:?}, expected >= 450ms",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

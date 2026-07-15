@@ -97,5 +97,6 @@ Precedence: env var > `config.toml` key > default.
 | `access_ttl` / `refresh_ttl` | `DOORMAN_ACCESS_TTL` / `_REFRESH_TTL` | 3600 / 60d | seconds |
 | `code_ttl` | `DOORMAN_CODE_TTL` | 120 | seconds, capped at 120 |
 | `rate_limit` | `DOORMAN_RATE_LIMIT` | 30 | requests/min per IP on auth endpoints; `0` disables |
+| `proxy_min_interval_ms` | `DOORMAN_PROXY_MIN_INTERVAL_MS` | 0 | min milliseconds between proxied upstream calls; paces (delays, never rejects) a burst so a rate-limited upstream API stays under its threshold; `0` disables |
 | `key_path` / `clients_path` | `DOORMAN_KEY_PATH` / `_CLIENTS_PATH` | in the instance dir | |
 | — | `DOORMAN_CONFIG` | `<instance dir>/config.toml` | override the config path (Docker) |

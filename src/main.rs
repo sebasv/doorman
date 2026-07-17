@@ -859,15 +859,14 @@ async fn doctor(name: &str) {
             "skipping token round-trip (no pre-registered client_id configured)",
             "",
         );
-    } else if roundtrip(&http, &cfg).await {
-        report(true, "full OAuth + token round-trip succeeded", "");
     } else {
-        ok = false;
-        report(
-            false,
-            "OAuth + token round-trip failed",
-            "check client_id/secret, owner_password, and allowed_redirect_uris",
-        );
+        match roundtrip(&http, &cfg).await {
+            Ok(()) => report(true, "OAuth + token round-trip succeeded", ""),
+            Err((msg, fix)) => {
+                ok = false;
+                report(false, &msg, &fix);
+            }
+        }
     }
 
     println!();
@@ -888,14 +887,24 @@ fn report(ok: bool, msg: &str, fix: &str) {
 }
 
 /// Drive authorize → token → authenticated /mcp against the live public URL.
-async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> bool {
+///
+/// On failure returns `(msg, fix)` naming the sub-step that broke and its HTTP
+/// status, so the diagnosis points at the real cause (rate limit, bad creds,
+/// upstream) rather than a single catch-all hint.
+async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> Result<(), (String, String)> {
     let redirect = match cfg.allowed_redirects.first() {
         Some(r) => r.clone(),
-        None => return false,
+        None => {
+            return Err((
+                "no redirect URI configured for the round-trip".into(),
+                "add an entry to allowed_redirect_uris".into(),
+            ))
+        }
     };
     let verifier = random_token(32);
     let challenge = sha256_b64url(verifier.as_bytes());
 
+    // authorize → a redirect carrying the authorization code.
     let auth = http
         .post(format!("{}/authorize", cfg.issuer))
         .form(&[
@@ -908,26 +917,53 @@ async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> bool {
         ])
         .send()
         .await;
-    let location = match auth {
-        Ok(r) => r
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
-        Err(_) => None,
+    let (auth_status, location) = match auth {
+        Ok(r) => {
+            let loc = r
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            (Some(r.status()), loc)
+        }
+        Err(e) => {
+            return Err((
+                format!("OAuth authorize call errored: {e}"),
+                format!(
+                    "check the tunnel is up and issuer_url ({}) is reachable",
+                    cfg.issuer
+                ),
+            ))
+        }
     };
-    let code = match location.as_deref().and_then(|l| l.split_once('?')) {
-        Some((_, q)) => q.split('&').find_map(|p| {
-            let (k, v) = p.split_once('=')?;
-            (k == "code").then(|| v.to_string())
-        }),
-        None => None,
-    };
+    let code = location
+        .as_deref()
+        .and_then(|l| l.split_once('?'))
+        .and_then(|(_, q)| {
+            q.split('&').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                (k == "code").then(|| v.to_string())
+            })
+        });
     let code = match code {
         Some(c) => c,
-        None => return false,
+        None => {
+            let status = auth_status.map_or(0, |s| s.as_u16());
+            return Err(if status == 429 {
+                (
+                    "OAuth authorize rate-limited (HTTP 429)".into(),
+                    "too many auth requests share the Funnel source IP — wait ~60s, or raise rate_limit".into(),
+                )
+            } else {
+                (
+                    format!("OAuth authorize failed (HTTP {status}) — no code returned"),
+                    "check owner_password and allowed_redirect_uris".into(),
+                )
+            });
+        }
     };
 
+    // token exchange → an access token.
     let tok = http
         .post(format!("{}/token", cfg.issuer))
         .form(&[
@@ -940,24 +976,66 @@ async fn roundtrip(http: &reqwest::Client, cfg: &Config) -> bool {
         ])
         .send()
         .await;
-    let access = match tok {
+    let (tok_status, access) = match tok {
         Ok(r) => {
+            let status = r.status();
             let body: serde_json::Value = r.json().await.unwrap_or_default();
-            body.get("access_token")
+            let access = body
+                .get("access_token")
                 .and_then(|v| v.as_str())
-                .map(String::from)
+                .map(String::from);
+            (Some(status), access)
         }
-        Err(_) => None,
+        Err(e) => {
+            return Err((
+                format!("token exchange call errored: {e}"),
+                format!(
+                    "check the tunnel is up and issuer_url ({}) is reachable",
+                    cfg.issuer
+                ),
+            ))
+        }
     };
     let access = match access {
         Some(a) => a,
-        None => return false,
+        None => {
+            let status = tok_status.map_or(0, |s| s.as_u16());
+            return Err(if status == 429 {
+                (
+                    "token exchange rate-limited (HTTP 429)".into(),
+                    "too many auth requests share the Funnel source IP — wait ~60s, or raise rate_limit".into(),
+                )
+            } else {
+                (
+                    format!("token exchange failed (HTTP {status})"),
+                    "check client_id and client_secret".into(),
+                )
+            });
+        }
     };
 
-    matches!(
-        http.post(format!("{}/mcp", cfg.issuer)).bearer_auth(&access).body("{}").send().await,
-        Ok(r) if r.status() != 401
-    )
+    // authenticated /mcp → a non-401 means the freshly minted token was accepted.
+    match http
+        .post(format!("{}/mcp", cfg.issuer))
+        .bearer_auth(&access)
+        .body("{}")
+        .send()
+        .await
+    {
+        Ok(r) if r.status() == 401 => Err((
+            "freshly minted token rejected at /mcp (401)".into(),
+            "check the token audience/issuer — issuer_url must match what the upstream expects"
+                .into(),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err((
+            format!("proxied /mcp call errored: {e}"),
+            format!(
+                "check the upstream MCP server is running — upstream_url ({}) / upstream_path ({})",
+                cfg.upstream, cfg.upstream_path
+            ),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2770,7 +2848,7 @@ mod tests {
         let mut dcfg = cfg.clone();
         let base = spawn_doorman(cfg).await;
         dcfg.issuer = base; // point the round-trip at the live ephemeral server
-        assert!(roundtrip(&client(), &dcfg).await);
+        assert!(roundtrip(&client(), &dcfg).await.is_ok());
     }
 
     #[tokio::test]
@@ -2780,7 +2858,31 @@ mod tests {
         let base = spawn_doorman(cfg).await;
         dcfg.issuer = base;
         dcfg.owner_password = "wrong".into();
-        assert!(!roundtrip(&client(), &dcfg).await);
+        let (msg, _fix) = roundtrip(&client(), &dcfg).await.unwrap_err();
+        // A wrong password fails at the authorize step (no code returned), not
+        // the token step, and must not be misreported as a 429 rate limit.
+        assert!(msg.contains("authorize failed"), "unexpected msg: {msg}");
+        assert!(!msg.contains("429"), "unexpected msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn doctor_roundtrip_reports_rate_limit_when_authorize_returns_429() {
+        let mut cfg = test_cfg("http://127.0.0.1:1");
+        cfg.rate_limit = 1;
+        let mut dcfg = cfg.clone();
+        let base = spawn_doorman(cfg).await;
+        dcfg.issuer = base.clone();
+        let c = client();
+        // Exhaust the shared per-IP budget so the round-trip's own authorize
+        // call trips the limiter and comes back as 429.
+        c.post(format!("{base}/authorize"))
+            .form(&[("client_id", "cid")])
+            .send()
+            .await
+            .unwrap();
+        let (msg, _fix) = roundtrip(&c, &dcfg).await.unwrap_err();
+        assert!(msg.contains("rate-limited"), "unexpected msg: {msg}");
+        assert!(msg.contains("429"), "unexpected msg: {msg}");
     }
 
     #[test]

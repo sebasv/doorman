@@ -100,3 +100,5 @@ Precedence: env var > `config.toml` key > default.
 | `proxy_min_interval_ms` | `DOORMAN_PROXY_MIN_INTERVAL_MS` | 0 | min milliseconds between proxied upstream calls; paces (delays, never rejects) a burst so a rate-limited upstream API stays under its threshold; `0` disables |
 | `key_path` / `clients_path` | `DOORMAN_KEY_PATH` / `_CLIENTS_PATH` | in the instance dir | |
 | — | `DOORMAN_CONFIG` | `<instance dir>/config.toml` | override the config path (Docker) |
+
+Config is read at startup, so after editing `config.toml` apply it with `doorman restart [name]` (or `systemctl --user restart doorman-<name>` / relaunch `doorman run` if you run it in the foreground).

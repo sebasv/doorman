@@ -297,7 +297,7 @@ async fn main() {
     // metacharacters before they can reach the filesystem, systemd, or schtasks.
     let name_scoped = matches!(
         cmd,
-        "run" | "init" | "doctor" | "delete" | "funnel-cmd" | "install-service"
+        "run" | "init" | "doctor" | "delete" | "funnel-cmd" | "install-service" | "restart"
     );
     if name_scoped && !is_valid_instance_name(&name) {
         eprintln!(
@@ -313,6 +313,7 @@ async fn main() {
         "list" => list(),
         "funnel-cmd" => funnel_cmd(&name),
         "install-service" => install_service(&name),
+        "restart" => restart_service(&name),
         "--version" | "-V" => println!("doorman {}", env!("CARGO_PKG_VERSION")),
         "--help" | "-h" | "" => print_usage(),
         other => {
@@ -330,6 +331,7 @@ fn print_usage() {
          COMMANDS:\n  \
          init [name]      Interactive setup for an instance; prints connector values\n  \
          run [name]       Start the instance (and supervise its upstream if configured)\n  \
+         restart [name]   Restart the instance's service to pick up config changes\n  \
          doctor [name]    Diagnose upstream, funnel, discovery, and a full token round-trip\n  \
          delete [name]    Stop & remove an instance (service, funnel, config)\n  \
          list             List configured instances and their status\n  \
@@ -1171,6 +1173,60 @@ fn remove_service(name: &str) {
         }
     } else if cfg!(target_os = "windows") {
         quiet("schtasks", &["/delete", "/tn", &id, "/f"]);
+    }
+}
+
+/// Restart an instance's installed service so it re-reads its config — the usual
+/// follow-up to editing config.toml. Targets the background service; for a
+/// foreground `doorman run`, stop it (Ctrl-C) and start it again instead.
+fn restart_service(name: &str) {
+    let id = service_id(name);
+    if cfg!(target_os = "linux") {
+        let unit = format!("{id}.service");
+        if run_cmd("systemctl", &["--user", "restart", &unit]) {
+            println!("Restarted {unit}.");
+        } else {
+            eprintln!(
+                "doorman: could not restart {unit} — is it installed? Run `doorman install-service {name}` first (or `doorman run {name}` to run it in the foreground)."
+            );
+            std::process::exit(1);
+        }
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME")
+            .unwrap_or_else(|_| die("HOME is not set; cannot locate the LaunchAgent".into()));
+        let label = format!("dev.{id}");
+        let path = format!("{home}/Library/LaunchAgents/{label}.plist");
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("doorman: no LaunchAgent for '{name}' — run `doorman install-service {name}` first.");
+            std::process::exit(1);
+        }
+        // unload + load re-reads the plist and restarts the agent, which re-reads config on start.
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if run_cmd("launchctl", &["load", "-w", &path]) {
+            println!("Restarted the {label} LaunchAgent.");
+        } else {
+            std::process::exit(1);
+        }
+    } else if cfg!(target_os = "windows") {
+        // The scheduled task shares the instance id; ending then running it is a restart.
+        let _ = std::process::Command::new("schtasks")
+            .args(["/end", "/tn", &id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if run_cmd("schtasks", &["/run", "/tn", &id]) {
+            println!("Restarted the {id} task.");
+        } else {
+            eprintln!("doorman: could not restart '{name}' — is the task installed?");
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!("doorman: automatic restart isn't supported on this OS. Restart `doorman run {name}` under your process manager.");
+        std::process::exit(1);
     }
 }
 

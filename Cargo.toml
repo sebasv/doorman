@@ -1,6 +1,6 @@
 [package]
 name = "doorman"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Front any static-token or no-auth HTTP service with the OAuth 2.1 flow Claude requires — in one binary. No IdP, no database."
 license = "MIT OR Apache-2.0"

@@ -44,6 +44,7 @@ connector*. The URL ends in `/mcp`.
 ```
 doorman init [name]      Interactive setup for an instance
 doorman run [name]       Run it (and supervise its upstream)
+doorman restart [name]   Restart the service to pick up config changes
 doorman doctor [name]    Diagnose upstream, funnel, discovery, token round-trip
 doorman list             List instances with status + URL
 doorman delete [name]    Stop & remove an instance (service, funnel, config)
